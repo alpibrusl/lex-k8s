@@ -29,6 +29,7 @@ pub mod facet;
 pub mod manifest;
 pub mod review;
 pub mod spec;
+pub mod trust;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +44,7 @@ pub use lex_os_manifest::{Grant, Level, Reversibility};
 pub use manifest::{narrow, pod_facet, LexManifest, ManifestReadError};
 pub use review::{respond, AdmissionRequest, AdmissionReview, ReviewError};
 pub use spec::{Container, ContainerKind, PodSpec, SpecError};
+pub use trust::{Keyring, Standing, Submitter, TrustError};
 
 /// One authority-bearing thing the pod declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

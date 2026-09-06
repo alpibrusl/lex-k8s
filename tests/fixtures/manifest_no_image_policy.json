@@ -1,0 +1,25 @@
+{
+  "apiVersion": "lex.dev/v1alpha1",
+  "kind": "LexManifest",
+  "metadata": {
+    "name": "payments",
+    "namespace": "payments"
+  },
+  "spec": {
+    "goal": "serve the payments API, with no image policy declared",
+    "grant": {
+      "egress": [
+        "postgres.payments.svc",
+        "api.stripe.com:443"
+      ],
+      "secrets": [
+        "payments-db"
+      ],
+      "capabilities": [],
+      "hostPath": false,
+      "privileged": false,
+      "hostNamespaces": false
+    },
+    "parent": "cluster/platform-default"
+  }
+}

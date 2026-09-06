@@ -28,17 +28,28 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use lex_k8s::{
-    admit, narrow, respond, review::cannot_run, AdmissionReview, ClusterSnapshot, LexManifest,
-    Reversibility, Verdict,
+    admit, narrow, respond, review::cannot_run, AdmissionReview, ClusterSnapshot, Keyring,
+    LexManifest, Reversibility, Standing, Verdict,
 };
 
 const USAGE: &str = "\
 usage:
-  lex-k8s admit    --manifest <LexManifest.json> [--snapshot <cluster.json>] < review.json
+  lex-k8s admit    --manifest <LexManifest.json> [--snapshot <cluster.json>]
+                   [--trusted-keys <keyring.json>] [--audit-out <log.json>] < review.json
   lex-k8s compile  --pod <pod.json> [--snapshot <cluster.json>]
   lex-k8s manifest narrow --parent <LexManifest.json> --child <LexManifest.json>
 
 `admit` reads an AdmissionReview on stdin and writes the response on stdout.
+--trusted-keys takes the `{\"trusted\":[...]}` keyring written by
+`lex producer-trust keyring --min-trust N`. A submitter that is not on it
+is held to the narrower reading of the same manifest: waivers the
+manifest grants — dimensions it declares no policy for — do not apply.
+It never widens the manifest. The submitter is the API server's
+authenticated `userInfo.username`, never a flag.
+
+--audit-out writes the hash-chained decision log, which is the input to
+`lex attest import-apply --accepted pod_admitted --refused pod_refused`.
+
 Without --snapshot the cluster is read as having no NetworkPolicy, which in
 Kubernetes means unrestricted egress — not none.
 
@@ -146,7 +157,41 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
         Err(c) => return c,
     };
 
-    let decision = match admit(&request.object_json(), &manifest, &snap, &request.meta()) {
+    let keyring = match flag(args, "--trusted-keys") {
+        None => None,
+        Some(path) => {
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("could not read {path}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            match Keyring::from_json(&src) {
+                Ok(k) => {
+                    if k.trusted.is_empty() {
+                        eprintln!(
+                            "warning: {path} trusts nobody, so no submitter gets the \
+                             manifest's waivers"
+                        );
+                    }
+                    Some(k)
+                }
+                Err(e) => {
+                    eprintln!("could not read the keyring {path}: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+
+    let decision = match admit(
+        &request.object_json(),
+        &manifest,
+        &snap,
+        &request.meta(),
+        keyring.as_ref(),
+    ) {
         Ok(d) => d,
         Err(e) => {
             // Answer the API server rather than dying silently: with
@@ -161,6 +206,24 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Written before the response goes out, and a failure to write is
+    // a failure of the wall: the promotion loop downstream reads this
+    // file, and a decision nobody can keep is not a record.
+    if let Some(path) = flag(args, "--audit-out") {
+        match decision.audit.to_json() {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    eprintln!("could not write the audit log {path}: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("could not serialise the audit log: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     let out = respond(&request.uid, &decision);
     println!(
@@ -187,6 +250,15 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
                 eprintln!("    at:     {}", r.source);
                 eprintln!("    reason: {}", r.reason);
             }
+        }
+    }
+    match (&decision.signer, decision.standing) {
+        (None, Standing::NotConsulted) => eprintln!("submitter: unauthenticated"),
+        (None, _) => eprintln!("submitter: unauthenticated (no earned standing)"),
+        (Some(w), Standing::NotConsulted) => eprintln!("submitter: {w} (trust not consulted)"),
+        (Some(w), Standing::Trusted) => eprintln!("submitter: {w} (in the trusted keyring)"),
+        (Some(w), Standing::Unknown) => {
+            eprintln!("submitter: {w} (not in the trusted keyring — no waivers)")
         }
     }
     eprintln!(
