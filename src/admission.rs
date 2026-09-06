@@ -6,6 +6,7 @@
 //!   → effects       spec + snapshot → rows                     (#2)
 //!   → lattice       pod.demands ≤ manifest.grant
 //!   → facet         every named thing is named in the grant
+//!   → trust         an unscored submitter gets no waivers
 //!   → pod_admitted | pod_refused
 //! ```
 //!
@@ -38,10 +39,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::facet::PodFacet;
 use crate::manifest::pod_facet;
+use crate::trust::{Keyring, Standing};
 use crate::{ClusterSnapshot, Effect, EffectRow, PodEffects, SpecError};
 
 /// What this wall records. lex-os knows nothing about any of it — which
 /// is why `Chain<E>` is generic (lex-os#67).
+///
+/// # The promotion contract
+///
+/// `pod_admitted` and `pod_refused` are shaped to satisfy
+/// `lex attest import-apply` (alpibrusl/lex-lang#794), which does not
+/// know this repo's vocabulary and so names three fields of its own:
+/// **`artifact_sha256`** (the decided bytes), **`manifest`** (the
+/// ceiling), and **`signer`** (who authorised it). `subject` is
+/// optional and human-facing — the `namespace/name` an operator would
+/// grep for.
+///
+/// That is why the spec hash is spelled `artifact_sha256` in the log
+/// while [`PodEffects`] still calls its field `spec_sha256`: the
+/// contract name belongs where the contract applies, and nowhere else.
+///
+/// The variant promoted is `PlanApply` for both gates. lex-iac emits a
+/// Terraform plan decision and this wall emits a Kubernetes admission
+/// decision, but they are the same fact — a plan-shaped artifact,
+/// checked against a manifest, decided under a signer — and a
+/// second discriminant would split one submitter's track record in two.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AdmissionEvent {
@@ -50,18 +72,36 @@ pub enum AdmissionEvent {
         uid: String,
         namespace: String,
         name: String,
-        spec_sha256: String,
+        artifact_sha256: String,
         snapshot_sha256: String,
         manifest: String,
         demands: Grant,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signer: Option<String>,
+        /// What the keyring said — `not-consulted` when none was given.
+        trust: String,
     },
     PodAdmitted {
         uid: String,
+        artifact_sha256: String,
         manifest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signer: Option<String>,
+        subject: String,
     },
     /// Refused, naming the single effect that tripped the wall.
+    ///
+    /// `reason` doubles as the contract's failure detail:
+    /// `import-apply` reads it into `AttestationResult::Failed`, so a
+    /// submitter's record says *why* it was refused, not merely that it
+    /// was.
     PodRefused {
         uid: String,
+        artifact_sha256: String,
+        manifest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signer: Option<String>,
+        subject: String,
         wall: String,
         effect: String,
         source: String,
@@ -81,6 +121,9 @@ pub enum Wall {
     TypeCheck,
     /// The pod names something the grant does not.
     Narrowing,
+    /// The manifest waived a check, and the submitter has no earned
+    /// standing to be waived for.
+    Trust,
 }
 
 impl Wall {
@@ -88,6 +131,7 @@ impl Wall {
         match self {
             Wall::TypeCheck => "type-check",
             Wall::Narrowing => "narrowing",
+            Wall::Trust => "trust",
         }
     }
 }
@@ -133,7 +177,14 @@ pub struct Decision {
     /// reading an admission deserves to know which one they got. The
     /// same distinction lex-iac draws between `None` and `Some(0)` for
     /// an unpriced change.
+    ///
+    /// For an unscored submitter each of these is also a refusal — see
+    /// [`Wall::Trust`].
     pub unchecked: Vec<String>,
+    /// Who asked, as the API server authenticated them.
+    pub signer: Option<String>,
+    /// What the keyring said about them.
+    pub standing: Standing,
 }
 
 impl Decision {
@@ -162,25 +213,43 @@ pub enum AdmissionError {
 }
 
 /// Check one pod against the manifest governing its namespace.
+/// `keyring` is the earned `{"trusted":[…]}` list, when the operator
+/// supplied one. It never widens anything: all it decides is whether a
+/// waiver the manifest *already* granted — an unchecked dimension —
+/// applies to this submitter. `None` consults nothing, and behaves
+/// exactly as this wall did before the keyring existed.
 pub fn admit(
     spec_json: &str,
     manifest: &Manifest,
     snapshot: &ClusterSnapshot,
     request: &RequestMeta,
+    keyring: Option<&Keyring>,
 ) -> Result<Decision, AdmissionError> {
     let pod = crate::compile_str(spec_json, snapshot)?;
     let facet = pod_facet(manifest).map_err(|e| AdmissionError::Manifest(e.to_string()))?;
     let manifest_id = manifest.content_id().0;
+
+    let standing = match (&request.signer, keyring) {
+        (_, None) => Standing::NotConsulted,
+        // A review nobody authenticated is not a submitter with a bad
+        // record; it is no submitter at all, and the narrower reading
+        // is the safe one.
+        (None, Some(_)) => Standing::Unknown,
+        (Some(who), Some(k)) => k.standing_of(who),
+    };
+    let subject = format!("{}/{}", request.namespace, request.name);
 
     let mut audit: Chain<AdmissionEvent> = Chain::new();
     audit.append(AdmissionEvent::PodRequested {
         uid: request.uid.clone(),
         namespace: request.namespace.clone(),
         name: request.name.clone(),
-        spec_sha256: pod.spec_sha256.clone(),
+        artifact_sha256: pod.spec_sha256.clone(),
         snapshot_sha256: pod.snapshot_sha256.clone(),
         manifest: manifest_id.clone(),
         demands: pod.demands,
+        signer: request.signer.clone(),
+        trust: standing.as_str().to_string(),
     });
 
     let mut refusals: Vec<Refusal> = Vec::new();
@@ -218,17 +287,57 @@ pub fn admit(
         }
     }
 
+    // Wall 3 — standing. Not a new authority: every dimension named
+    // here is one the *manifest* declared no policy for, so admitting
+    // under it is a waiver the manifest granted. A submitter with a
+    // record keeps the waiver; one nobody has scored does not.
+    //
+    // This can only ever refuse something the other two walls let
+    // through. It cannot admit anything they refused, which is the
+    // property that keeps the manifest the ceiling.
+    let unchecked = unchecked_dimensions(&facet, &pod);
+    if standing.needs_the_verb_named() {
+        for dimension in &unchecked {
+            refusals.push(Refusal {
+                wall: Wall::Trust,
+                effect: "unchecked".to_string(),
+                source: dimension
+                    .split(':')
+                    .next()
+                    .unwrap_or("manifest")
+                    .to_string(),
+                reason: format!(
+                    "{dimension}; the manifest waives that check, and \
+                     {} has no earned standing to be waived for — \
+                     declare the policy, or let the submitter earn a score",
+                    request
+                        .signer
+                        .as_deref()
+                        .unwrap_or("an unauthenticated submitter")
+                ),
+                grant_allows: Vec::new(),
+            });
+        }
+    }
+
     let verdict = match refusals.split_first() {
         None => {
             audit.append(AdmissionEvent::PodAdmitted {
                 uid: request.uid.clone(),
+                artifact_sha256: pod.spec_sha256.clone(),
                 manifest: manifest_id,
+                signer: request.signer.clone(),
+                subject: subject.clone(),
             });
             Verdict::Admit
         }
         Some((first, _)) => {
             audit.append(AdmissionEvent::PodRefused {
                 uid: request.uid.clone(),
+                artifact_sha256: pod.spec_sha256.clone(),
+                manifest: manifest_id,
+                signer: request.signer.clone(),
+                subject: subject.clone(),
                 wall: first.wall.as_str().to_string(),
                 effect: first.effect.clone(),
                 source: first.source.clone(),
@@ -243,9 +352,11 @@ pub fn admit(
 
     Ok(Decision {
         verdict,
-        unchecked: unchecked_dimensions(&facet, &pod),
+        unchecked,
         pod,
         audit,
+        signer: request.signer.clone(),
+        standing,
     })
 }
 
@@ -255,6 +366,12 @@ pub struct RequestMeta {
     pub uid: String,
     pub namespace: String,
     pub name: String,
+    /// The authenticated requester — a ServiceAccount or an agent key.
+    /// `None` when the review carried no `userInfo`, which the wall
+    /// records rather than papering over: an unattributed decision is
+    /// not evidence about anyone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
 }
 
 /// The row whose demand exceeds the grant by the most — the one worth
@@ -347,6 +464,7 @@ mod tests {
             uid: "abc-123".into(),
             namespace: "payments".into(),
             name: "api".into(),
+            signer: Some("system:serviceaccount:payments:deployer".into()),
         }
     }
 
@@ -357,7 +475,7 @@ mod tests {
 
     #[test]
     fn a_pod_inside_its_grant_is_admitted_and_recorded() {
-        let d = admit(GOOD, &manifest(), &snapshot(), &meta()).unwrap();
+        let d = admit(GOOD, &manifest(), &snapshot(), &meta(), None).unwrap();
         assert!(d.verdict.allowed(), "{:?}", d.verdict);
         assert_eq!(d.exit_code(), 0);
         assert_eq!(d.audit.len(), 2, "request then decision");
@@ -377,7 +495,7 @@ mod tests {
             }),
             ..snapshot()
         };
-        let d = admit(GOOD, &manifest(), &open, &meta()).unwrap();
+        let d = admit(GOOD, &manifest(), &open, &meta(), None).unwrap();
         assert_eq!(d.exit_code(), 8);
 
         let Verdict::Deny { all, .. } = &d.verdict else {
@@ -404,7 +522,7 @@ mod tests {
         let spec = r#"{"containers":[{"name":"api",
             "image":"registry.internal/payments/api@sha256:aa",
             "env":[{"name":"K","valueFrom":{"secretKeyRef":{"name":"root-ca-key","key":"k"}}}]}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta()).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
 
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!("expected a refusal, got {:?}", d.verdict);
@@ -425,7 +543,7 @@ mod tests {
     fn host_network_is_caught_by_the_lattice_not_the_egress_list() {
         let spec = r#"{"hostNetwork":true,"containers":[{"name":"api",
             "image":"registry.internal/payments/api@sha256:aa"}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta()).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
 
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!("expected a refusal");
@@ -448,7 +566,7 @@ mod tests {
             "image":"registry.internal/payments/api@sha256:aa"}],
             "initContainers":[{"name":"tuner","image":"registry.internal/ops@sha256:bb",
               "securityContext":{"privileged":true}}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta()).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
         assert!(!d.verdict.allowed());
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!()
@@ -465,7 +583,7 @@ mod tests {
         // The manifest names no imagePrefixes, and the pod's image is
         // from an untrusted source by the snapshot's reckoning.
         let spec = r#"{"containers":[{"name":"api","image":"docker.io/nginx:latest"}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta()).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
         assert!(
             d.unchecked.iter().any(|u| u.contains("image provenance")),
             "unchecked: {:?}",
@@ -483,7 +601,7 @@ mod tests {
         .unwrap()
         .1;
         let spec = r#"{"containers":[{"name":"api","image":"docker.io/nginx:latest"}]}"#;
-        let d = admit(spec, &strict, &snapshot(), &meta()).unwrap();
+        let d = admit(spec, &strict, &snapshot(), &meta(), None).unwrap();
 
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!("expected a refusal, got {:?}", d.verdict);
@@ -496,7 +614,7 @@ mod tests {
     #[test]
     fn a_document_that_is_not_a_pod_stops_the_wall_rather_than_refusing() {
         for not_a_pod in [r#"{}"#, r#"[]"#, r#"{"kind":"ConfigMap"}"#] {
-            let err = admit(not_a_pod, &manifest(), &snapshot(), &meta()).unwrap_err();
+            let err = admit(not_a_pod, &manifest(), &snapshot(), &meta(), None).unwrap_err();
             assert!(matches!(err, AdmissionError::Spec(_)), "{not_a_pod}: {err}");
         }
     }
@@ -511,6 +629,7 @@ mod tests {
             &manifest(),
             &snapshot(),
             &meta(),
+            None,
         )
         .unwrap();
         assert!(!d.verdict.allowed());

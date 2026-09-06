@@ -1,0 +1,37 @@
+{
+  "apiVersion": "v1",
+  "kind": "Pod",
+  "metadata": {
+    "name": "cache",
+    "namespace": "payments"
+  },
+  "spec": {
+    "serviceAccountName": "api",
+    "containers": [
+      {
+        "name": "api",
+        "image": "docker.io/library/redis:latest",
+        "securityContext": {
+          "allowPrivilegeEscalation": false,
+          "readOnlyRootFilesystem": true,
+          "capabilities": {
+            "drop": [
+              "ALL"
+            ]
+          }
+        },
+        "env": [
+          {
+            "name": "DB_PASSWORD",
+            "valueFrom": {
+              "secretKeyRef": {
+                "name": "payments-db",
+                "key": "password"
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -230,7 +230,7 @@ and ephemeral containers all contribute authority:
 - an **ephemeral container** is a live escalation path into a pod that
   was admitted long ago, and never appears in the create request.
 
-## Two walls, because one cannot say both things
+## Three walls, because one cannot say all three things
 
 The lattice bounds **how far**: `network: allowlist` means named
 destinations rather than the whole internet. The `pod` facet bounds
@@ -277,6 +277,80 @@ nowhere to put *"and this policy is itself bounded by that one"*. That
 is the reason to build this rather than write more Gatekeeper
 constraints — and it is the claim to judge the project on.
 
+## The third wall: earned standing
+
+The first two walls ask what the *pod* may do. The third asks what this
+*submitter* has earned — and it can only ever take something away.
+
+A manifest that names no `imagePrefixes` has declared no image policy.
+Milestone 2 admits under that silence and says out loud that nobody
+looked. That silence is a **waiver**, and a waiver is exactly the kind
+of thing a track record should decide: a submitter with a record keeps
+it, and one nobody has scored does not.
+
+```sh
+lex-k8s admit --manifest payments.json --trusted-keys trusted.json < review.json
+
+REFUSED   payments/cache — 1 wall(s) tripped
+  [trust] unchecked
+    at:     image provenance
+    reason: the manifest names no `imagePrefixes`, so images were not
+            checked; the manifest waives that check, and
+            system:serviceaccount:payments:intern has no earned standing
+            to be waived for — declare the policy, or let the submitter
+            earn a score
+```
+
+> **Trust narrows; it never widens.**
+
+This wall can only refuse what the other two admitted. It cannot admit
+anything they refused, which is what keeps the manifest the ceiling. A
+score is never authority.
+
+**The submitter is authenticated, not asserted.** It comes from the
+`AdmissionReview`'s `userInfo.username`, which the API server fills in
+after authenticating the requester — which is why there is no
+`--signer` flag here, where lex-iac needs one. A webhook that let its
+caller name the submitter would let any submitter spend another's
+record. A review carrying no `userInfo` is not a submitter with a poor
+record; it is no submitter at all, and gets the narrower reading.
+
+**Without `--trusted-keys` nothing is consulted and nothing tightens.**
+"We did not ask" and "we asked and they are not on it" are different
+facts, and the log records which. An empty keyring trusts nobody, the
+same way an empty allow-list grants nothing.
+
+### Earning it
+
+The keyring is an output of past admissions, not a configuration file.
+`--audit-out` writes the `{seq, prev_hash, event, hash}` array
+`lex attest import-apply` promotes:
+
+```sh
+lex-k8s admit --manifest payments.json --audit-out log.json < review.json
+
+lex attest import-apply --audit log.json --gate kubernetes \
+    --accepted pod_admitted --refused pod_refused
+lex producer-trust recompute --tool system:serviceaccount:payments:deployer
+lex producer-trust keyring --min-trust 700 --out trusted.json
+```
+
+Both verdicts are promoted, not only admissions: producer trust is
+`passed / (passed + failed)`, so a corpus of admissions alone would
+score every submitter 1.0 for ever.
+
+**One attestation kind, two gates.** These promote as `PlanApply`, the
+same variant lex-iac's Terraform decisions use — a plan-shaped
+artifact, checked against a manifest, decided under a signer. A
+Kubernetes-specific variant would split one submitter's record in two,
+so what differs between the gates lives in the payload (`gate`,
+`subject`), not in the discriminant. lex-lang never learns this repo's
+vocabulary: the caller names the event kinds, and a promotable event
+carries the three fields lex-lang *does* name — `artifact_sha256`,
+`manifest` and `signer`. That is why the spec hash is spelled
+`artifact_sha256` in the log while `PodEffects` still calls it
+`spec_sha256`.
+
 ## A refusal is a typed record
 
 Kubernetes has a place for this that most webhooks do not use:
@@ -318,10 +392,22 @@ point of a typed record is that a reader does not have to regex prose.
    be.
 4. **Signing is asserted, not verified.** This crate has no keys, no
    registry access, and no business doing crypto in an admission path.
-   It records what the snapshot claims. Milestone 3 turns accepted
-   admissions into attestations, and that is where trust is *earned*
-   rather than declared.
-5. **The dangerous-capability list is a list, and lists are wrong.** A
+   It records what the snapshot claims. What milestone 3 adds is a
+   record of *decisions*, earned per submitter — not verification of
+   the images themselves, which still rests on the snapshot's word.
+5. **A keyring cannot tell "never scored" from "scored badly".** Both
+   read as absent, and this wall deliberately does not guess between
+   them — `lex producer-trust recompute --tool <id>` is where an
+   operator finds out which. The threshold also lives with whoever
+   exported the keyring, not in the manifest, so two namespaces can
+   disagree about what 700 means.
+6. **The waiver is the only thing standing decides, and there is one of
+   them.** `imagePrefixes` is currently the sole dimension a manifest
+   can leave undeclared, so today the trust wall has exactly one lever.
+   That is honest rather than elegant: more levers should arrive as
+   more dimensions become waivable, not by inventing authority for a
+   score to hand out.
+7. **The dangerous-capability list is a list, and lists are wrong.** A
    capability not on it still raises `exec`, to `sandboxed` rather than
    `full`. Getting the list wrong understates one pod; getting the
    default wrong would understate all of them.

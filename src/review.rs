@@ -53,6 +53,25 @@ pub struct AdmissionRequest {
     /// `Pod`, which [`crate::PodSpec::from_json`] already unwraps.
     #[serde(default)]
     pub object: serde_json::Value,
+    /// Who submitted it.
+    ///
+    /// Unlike every other input to this wall, this one is not asserted
+    /// by the caller: the API server authenticates the requester and
+    /// fills it in. That is why lex-k8s takes no `--signer` flag where
+    /// lex-iac needs one — a webhook that let its caller name the
+    /// submitter would let any submitter borrow another's record.
+    #[serde(default)]
+    pub user_info: UserInfo,
+}
+
+/// The authenticated requester, as the API server reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInfo {
+    /// `system:serviceaccount:<namespace>:<name>` for a controller, or
+    /// a user identity for a person.
+    #[serde(default)]
+    pub username: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +169,10 @@ impl AdmissionRequest {
             uid: self.uid.clone(),
             namespace: self.namespace.clone(),
             name,
+            // Absent rather than empty: a review with no `userInfo` is
+            // one nobody authenticated, and an empty-string identity
+            // would pool every such request under one "signer".
+            signer: Some(self.user_info.username.clone()).filter(|u| !u.is_empty()),
         }
     }
 
@@ -301,7 +324,14 @@ mod tests {
     fn a_refusal_is_returned_as_kubernetes_shaped_causes() {
         let review = AdmissionReview::from_json(REVIEW).unwrap();
         let req = review.request().unwrap();
-        let d = admit(&req.object_json(), &manifest(), &snapshot(), &req.meta()).unwrap();
+        let d = admit(
+            &req.object_json(),
+            &manifest(),
+            &snapshot(),
+            &req.meta(),
+            None,
+        )
+        .unwrap();
         assert!(!d.verdict.allowed());
 
         let out = respond(&req.uid, &d);
@@ -332,7 +362,14 @@ mod tests {
         let review =
             AdmissionReview::from_json(&REVIEW.replace("root-ca-key", "stripe-live-key")).unwrap();
         let req = review.request().unwrap();
-        let d = admit(&req.object_json(), &manifest(), &snapshot(), &req.meta()).unwrap();
+        let d = admit(
+            &req.object_json(),
+            &manifest(),
+            &snapshot(),
+            &req.meta(),
+            None,
+        )
+        .unwrap();
         assert!(d.verdict.allowed(), "{:?}", d.verdict);
 
         let resp = respond(&req.uid, &d).response.unwrap();
