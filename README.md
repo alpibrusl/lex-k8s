@@ -230,7 +230,7 @@ and ephemeral containers all contribute authority:
 - an **ephemeral container** is a live escalation path into a pod that
   was admitted long ago, and never appears in the create request.
 
-## Three walls, because one cannot say all three things
+## Four walls, because one cannot say all four things
 
 The lattice bounds **how far**: `network: allowlist` means named
 destinations rather than the whole internet. The `pod` facet bounds
@@ -351,6 +351,88 @@ carries the three fields lex-lang *does* name — `artifact_sha256`,
 `artifact_sha256` in the log while `PodEffects` still calls it
 `spec_sha256`.
 
+## The fourth wall: the budget
+
+A namespace's committed spend, charged against
+`budget.max_money_cents` — the same integer-cents ceiling lex-iac
+charges a Terraform plan against, and the same house rule: **money
+never touches a float**.
+
+```sh
+lex-k8s admit --manifest payments.json \
+    --prices prices.json --spend spend.json < review.json
+
+REFUSED   payments/api — 1 wall(s) tripped
+  [budget] spend
+    at:     resources.requests
+    reason: this pod reserves USD 68.00/month (2000m CPU, 2048 MiB), which
+            would put `payments` at 218.00 against a ceiling of 200.00
+            (18.00 over) — this bounds committed reservation, not the invoice
+```
+
+> **Exceeding the budget refuses new admissions, never running pods.**
+
+An admission webhook has no eviction path and must never grow one. A
+namespace already over its ceiling keeps everything it is running; all
+this wall does is stop the next thing. The alternative fails
+catastrophically and asymmetrically: a price list edited by the wrong
+hand would take production down, to prevent an overspend that had
+already happened.
+
+### A pod's cost is computable; a namespace's is not
+
+This is the one place the Kubernetes gate has *more* to work with than
+the Terraform one. lex-iac cannot price a plan and takes an estimator's
+JSON; a pod declares what it wants reserved, and `requests × rate` is
+arithmetic. So the pod's own forecast is computed here from the spec,
+and only two things are supplied — what resources cost, and what the
+namespace already commits. Both are inputs rather than lookups, for the
+reason this repo keeps rediscovering: a webhook that phones a billing
+API is a webhook that fails when billing does, and `failurePolicy:
+Fail` turns that into a cluster that cannot schedule.
+
+**Requests, not limits.** Requests are what the scheduler reserves and
+what every cost tool bills against. A pod is charged for what it holds,
+not for what it may burst to.
+
+### Init containers are a peak, not a sum
+
+Kubernetes' own effective-request rule, and getting it wrong is not a
+rounding error:
+
+```text
+max( max over init containers,
+     sum over app containers + sidecars )
+```
+
+Init containers run sequentially *before* the app containers, so a
+migration that wants 2 cores for thirty seconds is not billed as if it
+held them all month. Sidecars — `restartPolicy: Always` init containers
+— are in the sum instead, because they run for the pod's whole life.
+This repo already drew that distinction for authority; it turns out to
+be load-bearing for money too. Ephemeral containers reserve nothing:
+Kubernetes forbids `resources` on them, so a debug container cannot
+change what a pod costs.
+
+### An empty request is not a request for nothing
+
+A container with no `resources.requests` is scheduled BestEffort and
+uses whatever the node has spare. Pricing that at zero would make
+deleting the `resources` block the cheapest way past any ceiling, so a
+pod that cannot be priced is refused while a budget is being enforced.
+The fourth outing for the rule PR #8 in lex-iac paid for.
+
+The same rule upward: a manifest that declares **no** `budget`
+authorises no spend, not unlimited spend. lex-os's default is
+`max_money_cents: 0`, and the CLI says so loudly rather than leaving an
+operator to work out why every pod is refused.
+
+`currency` sits on the facet for the reason it does in lex-iac:
+`max_money_cents` is a bare integer, so nothing in it says which
+currency, and a child namespace that redenominated its budget would
+have widened it. A report in another currency stops the wall rather
+than being converted.
+
 ## A refusal is a typed record
 
 Kubernetes has a place for this that most webhooks do not use:
@@ -401,13 +483,20 @@ point of a typed record is that a reader does not have to regex prose.
    operator finds out which. The threshold also lives with whoever
    exported the keyring, not in the manifest, so two namespaces can
    disagree about what 700 means.
-6. **The waiver is the only thing standing decides, and there is one of
+6. **The budget bounds committed reservation, not the invoice.**
+   `requests × list rate` ignores utilisation, spot pricing,
+   reservations and every negotiated discount. A reader who treats it
+   as a meter will size the ceiling wrong. It is also per-namespace and
+   monthly, and it trusts the spend report it is handed: a stale report
+   understates what is committed, always in the direction that admits
+   the pod.
+7. **The waiver is the only thing standing decides, and there is one of
    them.** `imagePrefixes` is currently the sole dimension a manifest
    can leave undeclared, so today the trust wall has exactly one lever.
    That is honest rather than elegant: more levers should arrive as
    more dimensions become waivable, not by inventing authority for a
    score to hand out.
-7. **The dangerous-capability list is a list, and lists are wrong.** A
+8. **The dangerous-capability list is a list, and lists are wrong.** A
    capability not on it still raises `exec`, to `sandboxed` rather than
    `full`. Getting the list wrong understates one pod; getting the
    default wrong would understate all of them.

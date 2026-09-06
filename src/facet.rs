@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use crate::effect::{Effect, Reach};
 
 /// What a namespace's pods may reach, by name.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PodFacet {
     /// Hosts, `host:port` entries or in-cluster selectors a pod may
@@ -72,6 +72,40 @@ pub struct PodFacet {
     /// Recorded rather than silently permissive: see [`PodFacet::admits`].
     #[serde(default)]
     pub image_prefixes: Vec<String>,
+    /// What `budget.max_money_cents` is denominated in.
+    ///
+    /// lex-os's budget is a bare integer, so nothing in it says which
+    /// currency. A spend report in another one is refused rather than
+    /// converted: EUR against a ceiling sized in USD is wrong by
+    /// whatever the rate is that day, silently and in whichever
+    /// direction.
+    ///
+    /// It lives on the facet rather than in webhook configuration
+    /// because a child namespace that redenominated its budget would
+    /// have widened it — ¥5000 is not $50 — so it has to narrow with
+    /// everything else. Same reasoning, same field, as lex-iac's
+    /// `infra` facet.
+    #[serde(default = "default_currency")]
+    pub currency: String,
+}
+
+fn default_currency() -> String {
+    "USD".to_string()
+}
+
+impl Default for PodFacet {
+    fn default() -> Self {
+        PodFacet {
+            egress: Vec::new(),
+            secrets: Vec::new(),
+            capabilities: Vec::new(),
+            host_path: false,
+            privileged: false,
+            host_namespaces: false,
+            image_prefixes: Vec::new(),
+            currency: default_currency(),
+        }
+    }
 }
 
 /// Why a pod's effect is not authorised by the facet.
@@ -132,6 +166,19 @@ impl Facet for PodFacet {
             parent.image_prefixes.iter().map(String::as_str),
             child.image_prefixes.iter().map(String::as_str),
         )?;
+
+        // A child may not redenominate its budget: the ceiling is an
+        // integer, so changing the unit changes the ceiling.
+        if !parent.currency.eq_ignore_ascii_case(&child.currency) {
+            return Err(FacetError::new(
+                Self::NAME,
+                format!(
+                    "currency: child is denominated in `{}` but the parent grants \
+                     `{}` — a budget in another unit is a different budget",
+                    child.currency, parent.currency
+                ),
+            ));
+        }
 
         // Ordered booleans: `false ≤ true`.
         for (field, p, c) in [

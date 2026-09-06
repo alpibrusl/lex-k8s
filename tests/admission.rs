@@ -34,8 +34,15 @@ fn snapshot(name: &str) -> ClusterSnapshot {
 fn decide(review: &str, m: &str, snap: &ClusterSnapshot) -> (String, lex_k8s::Decision) {
     let review = AdmissionReview::from_json(&fixture(review)).expect("a real review");
     let req = review.request().expect("with a request").clone();
-    let d =
-        admit(&req.object_json(), &manifest(m), snap, &req.meta(), None).expect("the wall runs");
+    let d = admit(
+        &req.object_json(),
+        &manifest(m),
+        snap,
+        &req.meta(),
+        None,
+        None,
+    )
+    .expect("the wall runs");
     (req.uid, d)
 }
 
@@ -229,6 +236,7 @@ fn an_admission_reports_the_dimensions_nobody_declared_a_policy_for() {
         &unvouched,
         &req.meta(),
         None,
+        None,
     )
     .unwrap();
     assert!(d.verdict.allowed(), "{:?}", d.verdict);
@@ -246,6 +254,7 @@ fn an_admission_reports_the_dimensions_nobody_declared_a_policy_for() {
         &permissive,
         &snapshot("snapshot_locked_down.json"),
         &req.meta(),
+        None,
         None,
     )
     .unwrap();
@@ -290,6 +299,7 @@ fn a_review_whose_object_is_not_a_pod_stops_the_wall() {
         &manifest("manifest_payments.json"),
         &snapshot("snapshot_locked_down.json"),
         &req.meta(),
+        None,
         None,
     )
     .unwrap_err();

@@ -35,6 +35,11 @@ pub enum SpecError {
          kind, or not a pod — this wall will not admit what it cannot read"
     )]
     NotAPodSpec,
+    /// A `resources.requests` quantity this build cannot read. Refuse,
+    /// don't round: a reservation nobody can parse is not a reservation
+    /// of nothing, and guessing runs in the pod's favour.
+    #[error(transparent)]
+    Quantity(#[from] crate::cost::CostError),
 }
 
 /// Where a container sits in the pod's lifecycle.
@@ -131,6 +136,34 @@ pub struct Container {
     pub env: Vec<EnvVar>,
     #[serde(default)]
     pub env_from: Vec<EnvFromSource>,
+    /// What the container asks the scheduler to reserve for it.
+    ///
+    /// `requests`, not `limits`: requests are what the scheduler
+    /// actually reserves and what every cost tool bills against, and a
+    /// pod is charged for what it holds rather than what it is allowed
+    /// to burst to.
+    #[serde(default)]
+    pub resources: Resources,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Resources {
+    #[serde(default)]
+    pub requests: ResourceList,
+}
+
+/// The `cpu` / `memory` quantities, as written.
+///
+/// Kept as strings here and parsed in [`crate::cost`]: a quantity this
+/// crate cannot read must be refused rather than rounded, and that is a
+/// decision for the wall rather than for `serde`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceList {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

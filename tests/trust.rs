@@ -91,6 +91,7 @@ fn decide(pod: &str, username: Option<&str>, m: &str, keyring: Option<&Keyring>)
         &snapshot("snapshot_locked_down.json"),
         &req.meta(),
         keyring,
+        None,
     )
     .expect("the wall runs")
 }
