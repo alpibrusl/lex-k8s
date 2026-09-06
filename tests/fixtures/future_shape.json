@@ -1,0 +1,11 @@
+{
+  "apiVersion": "v1", "kind": "Pod",
+  "spec": {
+    "someFutureIsolationMode": "confidential",
+    "containers": [{
+      "name": "app",
+      "image": "registry.internal/payments/api@sha256:3f7a1b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8",
+      "securityContext": { "futureEscapeHatch": true, "capabilities": { "add": ["CAP_UNKNOWN_FUTURE"] } }
+    }]
+  }
+}

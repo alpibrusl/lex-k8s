@@ -1,0 +1,16 @@
+{
+  "apiVersion": "v1", "kind": "Pod",
+  "metadata": { "name": "tuner", "namespace": "payments" },
+  "spec": {
+    "initContainers": [{
+      "name": "sysctl-tuner",
+      "image": "registry.internal/ops/tuner@sha256:bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899aabb",
+      "securityContext": { "privileged": true }
+    }],
+    "containers": [{
+      "name": "app",
+      "image": "registry.internal/payments/api@sha256:3f7a1b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8",
+      "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } }
+    }]
+  }
+}
