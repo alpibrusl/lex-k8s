@@ -1,0 +1,57 @@
+# The validating webhook registration.
+#
+# `failurePolicy: Fail` is not a tuning knob. With `Ignore`, a webhook
+# outage means every pod is admitted unchecked — which is not a wall, it
+# is a wall-shaped thing that opens under load. The consequence is real
+# and belongs in your runbook: if this webhook is down, admissions stop.
+#
+# HONEST CAUTION: anyone with cluster-admin can delete this object. The
+# audit chain records that they did; it does not stop them. The comparison
+# to Gatekeeper is winnable on narrowing, not on tamper-resistance.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: lex-k8s
+webhooks:
+  - name: pods.lex.dev
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    # Never gate the namespaces that would have to be running for the
+    # webhook itself to come back. A wall that can deadlock its own
+    # cluster is one someone will disable at 3am and never re-enable.
+    namespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values: [kube-system, kube-public, lex-system]
+    rules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods", "pods/ephemeralcontainers"]
+        scope: Namespaced
+    clientConfig:
+      service:
+        name: lex-k8s
+        namespace: lex-system
+        path: /admit
+        port: 443
+      # caBundle: <injected by cert-manager, or `kubectl` after you mint one>
+  - name: lexmanifests.lex.dev
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    failurePolicy: Fail
+    timeoutSeconds: 5
+    rules:
+      - apiGroups: ["lex.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["lexmanifests"]
+    clientConfig:
+      service:
+        name: lex-k8s
+        namespace: lex-system
+        path: /narrow
+        port: 443

@@ -22,16 +22,26 @@
 //! assert_eq!(pod.demands.network, Level::Full);
 //! ```
 
+pub mod admission;
 pub mod cluster;
 pub mod effect;
+pub mod facet;
+pub mod manifest;
+pub mod review;
 pub mod spec;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use admission::{
+    admit, AdmissionError, AdmissionEvent, Decision, Refusal, RequestMeta, Verdict, Wall,
+};
 pub use cluster::{ClusterSnapshot, EgressPolicy, RbacRule};
 pub use effect::{Effect, ImageDoubt, Reach, SecretVia, Source};
+pub use facet::{Denial, PodFacet};
 pub use lex_os_manifest::{Grant, Level, Reversibility};
+pub use manifest::{narrow, pod_facet, LexManifest, ManifestReadError};
+pub use review::{respond, AdmissionRequest, AdmissionReview, ReviewError};
 pub use spec::{Container, ContainerKind, PodSpec, SpecError};
 
 /// One authority-bearing thing the pod declares.

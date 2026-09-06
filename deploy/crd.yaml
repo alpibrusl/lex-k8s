@@ -1,0 +1,92 @@
+# The `LexManifest` CRD (alpibrusl/lex-k8s#3).
+#
+# `spec.grant` is the `pod` facet: allow-lists and ordered booleans, and
+# deliberately no deny list — a child that omits one of its parent's deny
+# entries would have *widened*, which inverts the whole invariant.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: lexmanifests.lex.dev
+spec:
+  group: lex.dev
+  scope: Namespaced
+  names:
+    plural: lexmanifests
+    singular: lexmanifest
+    kind: LexManifest
+    shortNames: [lexm]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [grant]
+              properties:
+                goal:
+                  type: string
+                  description: What the namespace is for. Carried into the audit record.
+                grant:
+                  type: object
+                  description: >-
+                    What pods in this namespace may reach, by name. Every field is a
+                    lattice: allow-lists narrow by subset, booleans by false <= true.
+                    An empty allow-list grants NOTHING, not everything.
+                  properties:
+                    egress:
+                      type: array
+                      items: { type: string }
+                    secrets:
+                      type: array
+                      items: { type: string }
+                    capabilities:
+                      type: array
+                      items: { type: string }
+                    imagePrefixes:
+                      type: array
+                      items: { type: string }
+                      description: >-
+                        Empty means image provenance is not checked, and an admission
+                        says so in its warnings rather than passing silently.
+                    hostPath: { type: boolean }
+                    privileged: { type: boolean }
+                    hostNamespaces: { type: boolean }
+                exec:
+                  type: string
+                  enum: [None, ReadOnly, Sandboxed, Loopback, ReadWrite, Allowlist, Full]
+                budget:
+                  type: object
+                  properties:
+                    wallClockSecs: { type: integer }
+                    maxCommands: { type: integer }
+                    maxMoneyCents: { type: integer }
+                    maxApiCalls: { type: integer }
+                isolationFloor:
+                  type: string
+                  description: >-
+                    NOT ENFORCED BY THIS REPO. The RuntimeClass that would back a floor
+                    is deliberately elsewhere (see issue #1), so a manifest declaring one
+                    is REFUSED unless spelled `unenforced-<floor>` — the operator saying
+                    they know. Accepting it silently would leave someone believing a
+                    boundary exists.
+                  enum:
+                    [namespace, gvisor, microvm,
+                     unenforced-namespace, unenforced-gvisor, unenforced-microvm]
+                parent:
+                  type: string
+                  description: >-
+                    `<namespace>/<name>`, or `cluster/<name>`. The manifest this one must
+                    narrow. A LexManifest that widens its parent is refused at admission:
+                    a team lead hands out authority they hold, never authority they do not.
+      additionalPrinterColumns:
+        - name: Goal
+          type: string
+          jsonPath: .spec.goal
+        - name: Parent
+          type: string
+          jsonPath: .spec.parent

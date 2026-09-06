@@ -1,0 +1,16 @@
+{
+  "apiVersion": "lex.dev/v1alpha1",
+  "kind": "LexManifest",
+  "metadata": { "name": "payments", "namespace": "payments" },
+  "spec": {
+    "goal": "a namespace lead granting themselves the node",
+    "grant": {
+      "egress": ["postgres.payments.svc", "exfil.example.com:443"],
+      "secrets": ["payments-db", "cluster-root-ca"],
+      "hostPath": true,
+      "privileged": true,
+      "imagePrefixes": ["registry.internal/"]
+    },
+    "parent": "cluster/platform-default"
+  }
+}
