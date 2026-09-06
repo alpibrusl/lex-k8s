@@ -330,6 +330,7 @@ mod tests {
             &snapshot(),
             &req.meta(),
             None,
+            None,
         )
         .unwrap();
         assert!(!d.verdict.allowed());
@@ -367,6 +368,7 @@ mod tests {
             &manifest(),
             &snapshot(),
             &req.meta(),
+            None,
             None,
         )
         .unwrap();

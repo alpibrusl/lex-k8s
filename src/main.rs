@@ -28,14 +28,15 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use lex_k8s::{
-    admit, narrow, respond, review::cannot_run, AdmissionReview, ClusterSnapshot, Keyring,
-    LexManifest, Reversibility, Standing, Verdict,
+    admission::Spend, admit, narrow, respond, review::cannot_run, AdmissionReview, ClusterSnapshot,
+    Keyring, LexManifest, PriceList, Reversibility, SpendReport, Standing, Verdict,
 };
 
 const USAGE: &str = "\
 usage:
   lex-k8s admit    --manifest <LexManifest.json> [--snapshot <cluster.json>]
-                   [--trusted-keys <keyring.json>] [--audit-out <log.json>] < review.json
+                   [--trusted-keys <keyring.json>] [--prices <prices.json>]
+                   [--spend <spend.json>] [--audit-out <log.json>] < review.json
   lex-k8s compile  --pod <pod.json> [--snapshot <cluster.json>]
   lex-k8s manifest narrow --parent <LexManifest.json> --child <LexManifest.json>
 
@@ -46,6 +47,12 @@ is held to the narrower reading of the same manifest: waivers the
 manifest grants — dimensions it declares no policy for — do not apply.
 It never widens the manifest. The submitter is the API server's
 authenticated `userInfo.username`, never a flag.
+
+--prices and --spend enable the budget wall, and are only meaningful
+together: --prices gives the cost of a core-month and a GiB-month, --spend
+what the namespace already commits per month. The pod's own reservation is
+computed from its `resources.requests`. Without both, no budget wall runs —
+this refuses new admissions only, and never evicts a running pod.
 
 --audit-out writes the hash-chained decision log, which is the input to
 `lex attest import-apply --accepted pod_admitted --refused pod_refused`.
@@ -112,16 +119,30 @@ fn snapshot(args: &[&str]) -> Result<ClusterSnapshot, ExitCode> {
     }
 }
 
-fn load_manifest(args: &[&str]) -> Result<lex_os_manifest::Manifest, ExitCode> {
+/// Returns the resolved manifest and whether it *declared* a budget.
+///
+/// The second half matters only when the budget wall is running: a
+/// manifest with no `budget` resolves to lex-os's default, whose
+/// `max_money_cents` is **zero**. That is the right reading — a
+/// manifest naming no budget authorises no spend, the same way an empty
+/// allow-list grants nothing — but an operator who turns the wall on
+/// and watches every pod get refused deserves to be told why rather
+/// than left to work it out.
+fn load_manifest(args: &[&str]) -> Result<(lex_os_manifest::Manifest, bool), ExitCode> {
     let Some(path) = flag(args, "--manifest") else {
         eprintln!("needs --manifest\n\n{USAGE}");
         return Err(ExitCode::from(2));
     };
     let src = read(path)?;
-    LexManifest::read(&src).map(|(_, m)| m).map_err(|e| {
-        eprintln!("could not read the LexManifest {path}: {e}");
-        ExitCode::from(2)
-    })
+    LexManifest::read(&src)
+        .map(|(crd, m)| {
+            let declared = crd.spec.budget.is_some();
+            (m, declared)
+        })
+        .map_err(|e| {
+            eprintln!("could not read the LexManifest {path}: {e}");
+            ExitCode::from(2)
+        })
 }
 
 fn cmd_admit(args: &[&str]) -> ExitCode {
@@ -148,7 +169,7 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
         }
     };
 
-    let manifest = match load_manifest(args) {
+    let (manifest, budget_declared) = match load_manifest(args) {
         Ok(m) => m,
         Err(c) => return c,
     };
@@ -185,12 +206,60 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
         }
     };
 
+    // The budget wall's two inputs are only meaningful together, so
+    // half of it is a usage error rather than a silent half-check: a
+    // pipeline that meant to enforce a budget and quietly did not is
+    // worse off than one told what is missing.
+    let spend = match (flag(args, "--prices"), flag(args, "--spend")) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            eprintln!(
+                "--prices and --spend go together: pricing a pod without knowing what \
+                 the namespace already spends checks nothing\n\n{USAGE}"
+            );
+            return ExitCode::from(2);
+        }
+        (Some(p), Some(r)) => {
+            if !budget_declared {
+                eprintln!(
+                    "warning: this LexManifest declares no `budget`, so it authorises \
+                     no spend at all ({} minor units) and every priced pod will be \
+                     refused — declare one, or drop --prices/--spend",
+                    manifest.budget.max_money_cents
+                );
+            }
+            let (prices_src, report_src) =
+                match (std::fs::read_to_string(p), std::fs::read_to_string(r)) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    (Err(e), _) => {
+                        eprintln!("could not read {p}: {e}");
+                        return ExitCode::from(2);
+                    }
+                    (_, Err(e)) => {
+                        eprintln!("could not read {r}: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+            match (
+                PriceList::from_json(&prices_src),
+                SpendReport::from_json(&report_src),
+            ) {
+                (Ok(prices), Ok(report)) => Some(Spend { prices, report }),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+
     let decision = match admit(
         &request.object_json(),
         &manifest,
         &snap,
         &request.meta(),
         keyring.as_ref(),
+        spend.as_ref(),
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -251,6 +320,14 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
                 eprintln!("    reason: {}", r.reason);
             }
         }
+    }
+    match decision.charged {
+        Some(minor) => eprintln!(
+            "spend:     this pod reserves {}.{:02} / month (forecast on requests, not a meter)",
+            minor / 100,
+            minor % 100
+        ),
+        None => eprintln!("spend:     unpriced — no --prices/--spend"),
     }
     match (&decision.signer, decision.standing) {
         (None, Standing::NotConsulted) => eprintln!("submitter: unauthenticated"),

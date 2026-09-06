@@ -7,6 +7,8 @@
 //!   → lattice       pod.demands ≤ manifest.grant
 //!   → facet         every named thing is named in the grant
 //!   → trust         an unscored submitter gets no waivers
+//!   → spend_charged the pod's reservation, priced and recorded
+//!   → budget        the namespace must still fit `max_money_cents`
 //!   → pod_admitted | pod_refused
 //! ```
 //!
@@ -37,6 +39,7 @@ use lex_os_audit::{Chain, ChainPayload};
 use lex_os_manifest::{Grant, Manifest};
 use serde::{Deserialize, Serialize};
 
+use crate::cost::{CostError, PriceList, SpendReport};
 use crate::facet::PodFacet;
 use crate::manifest::pod_facet;
 use crate::trust::{Keyring, Standing};
@@ -81,6 +84,19 @@ pub enum AdmissionEvent {
         /// What the keyring said — `not-consulted` when none was given.
         trust: String,
     },
+    /// The pod's priced reservation, recorded before the budget wall
+    /// decides — so an admission carries the number it was admitted
+    /// against, not only a refusal.
+    SpendCharged {
+        uid: String,
+        artifact_sha256: String,
+        currency: String,
+        cpu_millicores: u64,
+        memory_bytes: u64,
+        pod_monthly_minor: u64,
+        namespace_monthly_minor: u64,
+        budget_minor: u64,
+    },
     PodAdmitted {
         uid: String,
         artifact_sha256: String,
@@ -124,6 +140,9 @@ pub enum Wall {
     /// The manifest waived a check, and the submitter has no earned
     /// standing to be waived for.
     Trust,
+    /// Admitting the pod would put the namespace over
+    /// `budget.max_money_cents`.
+    Budget,
 }
 
 impl Wall {
@@ -132,6 +151,7 @@ impl Wall {
             Wall::TypeCheck => "type-check",
             Wall::Narrowing => "narrowing",
             Wall::Trust => "trust",
+            Wall::Budget => "budget",
         }
     }
 }
@@ -185,6 +205,9 @@ pub struct Decision {
     pub signer: Option<String>,
     /// What the keyring said about them.
     pub standing: Standing,
+    /// What this pod's reservation was priced at, in minor units, when
+    /// a price list was supplied. `None` means *unpriced*, never zero.
+    pub charged: Option<u64>,
 }
 
 impl Decision {
@@ -210,9 +233,32 @@ pub enum AdmissionError {
     Spec(#[from] SpecError),
     #[error("the manifest's `pod` facet is present but unreadable: {0}")]
     Manifest(String),
+    /// The spend inputs could not be reconciled with the grant — a
+    /// report in another currency, say. Not a refusal: the wall could
+    /// not run.
+    #[error(transparent)]
+    Cost(#[from] CostError),
+}
+
+/// What the namespace already spends, and what resources cost.
+///
+/// Two numbers rather than one because they answer different
+/// questions and come from different places: the price list is a
+/// standing fact about the cluster, and the report is a measurement
+/// somebody took. Bundled so `admit` takes one optional argument
+/// rather than two that are only ever meaningful together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Spend {
+    pub prices: PriceList,
+    pub report: SpendReport,
 }
 
 /// Check one pod against the manifest governing its namespace.
+/// `spend` is the price list plus what the namespace already spends,
+/// when the operator supplied them. `None` runs no budget wall at all —
+/// the same shape as `keyring`, and for the same reason: a wall nobody
+/// configured must not invent a ceiling.
+///
 /// `keyring` is the earned `{"trusted":[…]}` list, when the operator
 /// supplied one. It never widens anything: all it decides is whether a
 /// waiver the manifest *already* granted — an unchecked dimension —
@@ -224,6 +270,7 @@ pub fn admit(
     snapshot: &ClusterSnapshot,
     request: &RequestMeta,
     keyring: Option<&Keyring>,
+    spend: Option<&Spend>,
 ) -> Result<Decision, AdmissionError> {
     let pod = crate::compile_str(spec_json, snapshot)?;
     let facet = pod_facet(manifest).map_err(|e| AdmissionError::Manifest(e.to_string()))?;
@@ -320,6 +367,88 @@ pub fn admit(
         }
     }
 
+    // Wall 4 — the budget. After the others and before admitting,
+    // matching lex-os's gate order, and the charge is recorded whether
+    // or not it fits: a budget you can only see once it was exceeded is
+    // not a budget anyone can plan against.
+    //
+    // **This refuses admissions; it never evicts.** A namespace already
+    // over its ceiling keeps every pod it is running — the wall's whole
+    // job is to stop the *next* one. An admission webhook that could
+    // take down running workloads because a price list changed would be
+    // a far worse failure than the overspend it prevented.
+    let mut charged = None;
+    if let Some(s) = spend {
+        s.report.check_currency(&facet.currency)?;
+        let r = pod.reservation.reservation;
+        let pod_minor = s.prices.price(&r);
+        let after = s.report.namespace_monthly_minor.saturating_add(pod_minor);
+        let budget = manifest.budget.max_money_cents;
+        audit.append(AdmissionEvent::SpendCharged {
+            uid: request.uid.clone(),
+            artifact_sha256: pod.spec_sha256.clone(),
+            currency: facet.currency.clone(),
+            cpu_millicores: r.cpu_millicores,
+            memory_bytes: r.memory_bytes,
+            pod_monthly_minor: pod_minor,
+            namespace_monthly_minor: s.report.namespace_monthly_minor,
+            budget_minor: budget,
+        });
+        charged = Some(pod_minor);
+
+        // A container that declared nothing cannot be charged, and
+        // pricing it at zero would make omitting `requests` the
+        // cheapest way past the ceiling — the exact evasion this wall
+        // exists to prevent. Refused before the arithmetic, because the
+        // arithmetic would otherwise look like it succeeded.
+        for u in &pod.reservation.undeclared {
+            refusals.push(Refusal {
+                wall: Wall::Budget,
+                effect: "unpriced".to_string(),
+                source: format!("{}[{}].resources.requests", u.kind, u.container),
+                reason: format!(
+                    "container `{}` declares no CPU or memory request, so it cannot be \
+                     charged against the namespace budget — an empty request is not a \
+                     request for nothing, it is a BestEffort pod that uses whatever the \
+                     node has spare",
+                    u.container
+                ),
+                grant_allows: vec![format!(
+                    "budget: {} {} / month",
+                    facet.currency,
+                    money(budget)
+                )],
+            });
+        }
+
+        if after > budget {
+            refusals.push(Refusal {
+                wall: Wall::Budget,
+                effect: "spend".to_string(),
+                source: "resources.requests".to_string(),
+                reason: format!(
+                    "this pod reserves {} {}/month ({}m CPU, {} MiB), which would put \
+                     `{}` at {} against a ceiling of {} ({} over) — this bounds \
+                     committed reservation, not the invoice",
+                    facet.currency,
+                    money(pod_minor),
+                    r.cpu_millicores,
+                    r.memory_bytes / (1024 * 1024),
+                    request.namespace,
+                    money(after),
+                    money(budget),
+                    money(after - budget),
+                ),
+                grant_allows: vec![format!(
+                    "budget: {} {} / month, of which {} is already committed",
+                    facet.currency,
+                    money(budget),
+                    money(s.report.namespace_monthly_minor)
+                )],
+            });
+        }
+    }
+
     let verdict = match refusals.split_first() {
         None => {
             audit.append(AdmissionEvent::PodAdmitted {
@@ -357,6 +486,7 @@ pub fn admit(
         audit,
         signer: request.signer.clone(),
         standing,
+        charged,
     })
 }
 
@@ -372,6 +502,12 @@ pub struct RequestMeta {
     /// not evidence about anyone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<String>,
+}
+
+/// Minor units as a decimal. Integer arithmetic only, matching the
+/// house rule that money never touches a float.
+fn money(minor: u64) -> String {
+    format!("{}.{:02}", minor / 100, minor % 100)
 }
 
 /// The row whose demand exceeds the grant by the most — the one worth
@@ -475,7 +611,7 @@ mod tests {
 
     #[test]
     fn a_pod_inside_its_grant_is_admitted_and_recorded() {
-        let d = admit(GOOD, &manifest(), &snapshot(), &meta(), None).unwrap();
+        let d = admit(GOOD, &manifest(), &snapshot(), &meta(), None, None).unwrap();
         assert!(d.verdict.allowed(), "{:?}", d.verdict);
         assert_eq!(d.exit_code(), 0);
         assert_eq!(d.audit.len(), 2, "request then decision");
@@ -495,7 +631,7 @@ mod tests {
             }),
             ..snapshot()
         };
-        let d = admit(GOOD, &manifest(), &open, &meta(), None).unwrap();
+        let d = admit(GOOD, &manifest(), &open, &meta(), None, None).unwrap();
         assert_eq!(d.exit_code(), 8);
 
         let Verdict::Deny { all, .. } = &d.verdict else {
@@ -522,7 +658,7 @@ mod tests {
         let spec = r#"{"containers":[{"name":"api",
             "image":"registry.internal/payments/api@sha256:aa",
             "env":[{"name":"K","valueFrom":{"secretKeyRef":{"name":"root-ca-key","key":"k"}}}]}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None, None).unwrap();
 
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!("expected a refusal, got {:?}", d.verdict);
@@ -543,7 +679,7 @@ mod tests {
     fn host_network_is_caught_by_the_lattice_not_the_egress_list() {
         let spec = r#"{"hostNetwork":true,"containers":[{"name":"api",
             "image":"registry.internal/payments/api@sha256:aa"}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None, None).unwrap();
 
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!("expected a refusal");
@@ -566,7 +702,7 @@ mod tests {
             "image":"registry.internal/payments/api@sha256:aa"}],
             "initContainers":[{"name":"tuner","image":"registry.internal/ops@sha256:bb",
               "securityContext":{"privileged":true}}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None, None).unwrap();
         assert!(!d.verdict.allowed());
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!()
@@ -583,7 +719,7 @@ mod tests {
         // The manifest names no imagePrefixes, and the pod's image is
         // from an untrusted source by the snapshot's reckoning.
         let spec = r#"{"containers":[{"name":"api","image":"docker.io/nginx:latest"}]}"#;
-        let d = admit(spec, &manifest(), &snapshot(), &meta(), None).unwrap();
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None, None).unwrap();
         assert!(
             d.unchecked.iter().any(|u| u.contains("image provenance")),
             "unchecked: {:?}",
@@ -601,7 +737,7 @@ mod tests {
         .unwrap()
         .1;
         let spec = r#"{"containers":[{"name":"api","image":"docker.io/nginx:latest"}]}"#;
-        let d = admit(spec, &strict, &snapshot(), &meta(), None).unwrap();
+        let d = admit(spec, &strict, &snapshot(), &meta(), None, None).unwrap();
 
         let Verdict::Deny { all, .. } = &d.verdict else {
             panic!("expected a refusal, got {:?}", d.verdict);
@@ -614,7 +750,7 @@ mod tests {
     #[test]
     fn a_document_that_is_not_a_pod_stops_the_wall_rather_than_refusing() {
         for not_a_pod in [r#"{}"#, r#"[]"#, r#"{"kind":"ConfigMap"}"#] {
-            let err = admit(not_a_pod, &manifest(), &snapshot(), &meta(), None).unwrap_err();
+            let err = admit(not_a_pod, &manifest(), &snapshot(), &meta(), None, None).unwrap_err();
             assert!(matches!(err, AdmissionError::Spec(_)), "{not_a_pod}: {err}");
         }
     }
@@ -629,6 +765,7 @@ mod tests {
             &manifest(),
             &snapshot(),
             &meta(),
+            None,
             None,
         )
         .unwrap();

@@ -24,6 +24,7 @@
 
 pub mod admission;
 pub mod cluster;
+pub mod cost;
 pub mod effect;
 pub mod facet;
 pub mod manifest;
@@ -38,12 +39,13 @@ pub use admission::{
     admit, AdmissionError, AdmissionEvent, Decision, Refusal, RequestMeta, Verdict, Wall,
 };
 pub use cluster::{ClusterSnapshot, EgressPolicy, RbacRule};
+pub use cost::{CostError, PodReservation, PriceList, Reservation, SpendReport, Undeclared};
 pub use effect::{Effect, ImageDoubt, Reach, SecretVia, Source};
 pub use facet::{Denial, PodFacet};
 pub use lex_os_manifest::{Grant, Level, Reversibility};
 pub use manifest::{narrow, pod_facet, LexManifest, ManifestReadError};
 pub use review::{respond, AdmissionRequest, AdmissionReview, ReviewError};
-pub use spec::{Container, ContainerKind, PodSpec, SpecError};
+pub use spec::{Container, ContainerKind, PodSpec, ResourceList, Resources, SpecError};
 pub use trust::{Keyring, Standing, Submitter, TrustError};
 
 /// One authority-bearing thing the pod declares.
@@ -68,6 +70,12 @@ pub struct PodEffects {
     pub rows: Vec<EffectRow>,
     /// The join of every row: the grant this pod needs.
     pub demands: Grant,
+    /// What the pod asks the scheduler to reserve, by Kubernetes' own
+    /// effective-request rule, plus any container that declared
+    /// nothing. Computed here because it is a fact about the spec, the
+    /// same as an effect row; what it *costs* needs a price list, which
+    /// is the wall's business rather than the compiler's.
+    pub reservation: PodReservation,
 }
 
 impl PodEffects {
@@ -112,12 +120,16 @@ impl PodEffects {
 /// mode is a document that is not a pod spec.
 pub fn compile_str(src: &str, snapshot: &ClusterSnapshot) -> Result<PodEffects, SpecError> {
     let spec = PodSpec::from_json(src)?;
-    Ok(compile(&spec, snapshot, src))
+    compile(&spec, snapshot, src)
 }
 
 /// Compile an already-parsed spec, pinning `raw` as the identity of the
 /// bytes. Prefer [`compile_str`] unless you parsed it yourself.
-pub fn compile(spec: &PodSpec, snapshot: &ClusterSnapshot, raw: &str) -> PodEffects {
+pub fn compile(
+    spec: &PodSpec,
+    snapshot: &ClusterSnapshot,
+    raw: &str,
+) -> Result<PodEffects, SpecError> {
     let mut rows: Vec<EffectRow> = Vec::new();
     let mut push = |effect: Effect, source: Source| {
         rows.push(EffectRow {
@@ -309,12 +321,13 @@ pub fn compile(spec: &PodSpec, snapshot: &ClusterSnapshot, raw: &str) -> PodEffe
         effect::join,
     );
 
-    PodEffects {
+    Ok(PodEffects {
         spec_sha256: sha256_hex(raw),
         snapshot_sha256: snapshot.content_id(),
         rows,
         demands,
-    }
+        reservation: cost::effective_requests(&spec.all_containers())?,
+    })
 }
 
 /// Is there reason to doubt this image is what it claims?
