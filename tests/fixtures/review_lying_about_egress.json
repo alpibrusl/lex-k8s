@@ -1,0 +1,30 @@
+{
+  "apiVersion": "admission.k8s.io/v1",
+  "kind": "AdmissionReview",
+  "request": {
+    "uid": "705ab4f5-6393-11e8-b7cc-42010a800002",
+    "kind": { "group": "", "version": "v1", "kind": "Pod" },
+    "resource": { "group": "", "version": "v1", "resource": "pods" },
+    "namespace": "payments",
+    "name": "",
+    "operation": "CREATE",
+    "userInfo": { "username": "system:serviceaccount:payments:deployer" },
+    "object": {
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": {
+        "generateName": "exporter-7d9f-",
+        "namespace": "payments",
+        "annotations": { "lex.dev/egress": "metrics.internal:9090" }
+      },
+      "spec": {
+        "serviceAccountName": "exporter",
+        "containers": [{
+          "name": "exporter",
+          "image": "registry.internal/payments/exporter@sha256:aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899",
+          "securityContext": { "allowPrivilegeEscalation": false, "capabilities": { "drop": ["ALL"] } }
+        }]
+      }
+    }
+  }
+}

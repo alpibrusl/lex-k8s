@@ -28,6 +28,52 @@ a downstream consumer of it, and it belongs in the lex-os workspace.
 
 ## Try it
 
+The demo #3 exists to refuse — a pod that lies about its egress, stopped
+before it schedules:
+
+```sh
+cargo run -- admit \
+  --manifest tests/fixtures/manifest_payments.json \
+  --snapshot tests/fixtures/snapshot_policy_is_a_lie.json \
+  < tests/fixtures/review_lying_about_egress.json
+```
+
+```
+REFUSED   payments/exporter-7d9f- — 2 wall(s) tripped
+  [type-check] egress:unrestricted
+    at:     spec.egress
+    reason: trust widening on network: child requests `full` but parent
+            only grants `allowlist`
+  [narrowing] egress:unrestricted
+    at:     spec.egress
+    reason: `0.0.0.0/0` is not among the 2 the manifest grants:
+            postgres.payments.svc, api.stripe.com:443
+audit: 2 entries, head sha256:452a9848…
+exit 8
+```
+
+The pod drops `ALL` capabilities, pins its image by digest, and annotates
+itself with a narrow egress. A forgotten `legacy-allow-all` NetworkPolicy
+also selects it. **An annotation is a claim; a NetworkPolicy is the wall.**
+
+And the wall a constraint language has nowhere to put — on the policies
+themselves:
+
+```sh
+cargo run -- manifest narrow \
+  --parent tests/fixtures/manifest_platform.json \
+  --child  tests/fixtures/manifest_mints_itself_root.json
+```
+
+```
+REFUSED — the child widens its parent.
+  trust widening on filesystem: child requests `full` but parent only
+  grants `read-only`
+
+A team lead hands out authority they hold, never authority they
+do not.
+```
+
 ```sh
 cargo run --example compile_pod
 ```
@@ -80,13 +126,22 @@ That pod's *app* container is unremarkable. Reading only `containers[0]`
 
 ## Where this is
 
-**Milestone 1 of [#1](https://github.com/alpibrusl/lex-k8s/issues/1).**
+**Milestones 1 and 2 of [#1](https://github.com/alpibrusl/lex-k8s/issues/1).**
 A pure function from a `PodSpec` and a cluster snapshot to effect rows
-([#2](https://github.com/alpibrusl/lex-k8s/issues/2)). No cluster, no
-API server, no CRD, no certificates.
+([#2](https://github.com/alpibrusl/lex-k8s/issues/2)), the `LexManifest`
+CRD, the two admission walls, and the hash-chained audit
+([#3](https://github.com/alpibrusl/lex-k8s/issues/3)).
 
-Not yet here: the `LexManifest` CRD and the admission webhook
-([#3](https://github.com/alpibrusl/lex-k8s/issues/3)), and attestation
+**There is no serving binary yet, and that is deliberate.** `lex-k8s
+admit` reads an `AdmissionReview` on stdin and writes the response on
+stdout — exactly what a webhook does between its TLS handshake and its
+HTTP reply. The deployment manifests are in [`deploy/`](deploy/). What
+is missing is the HTTP+TLS wrapper and a cluster to test it against;
+shipping an untested TLS server would be worse than shipping none, so
+the `kind` demo in #3 is still open and is the one part of this
+milestone nobody has run.
+
+Not yet here: attestation
 ([#4](https://github.com/alpibrusl/lex-k8s/issues/4)).
 
 ## The effect model
@@ -175,23 +230,98 @@ and ephemeral containers all contribute authority:
 - an **ephemeral container** is a live escalation path into a pod that
   was admitted long ago, and never appears in the create request.
 
+## Two walls, because one cannot say both things
+
+The lattice bounds **how far**: `network: allowlist` means named
+destinations rather than the whole internet. The `pod` facet bounds
+**where**: which hosts, which Secrets, which capabilities.
+
+Neither alone is enough, and the gap is not theoretical:
+
+| a pod that… | lattice | facet |
+| --- | --- | --- |
+| reaches `exfil.example.com` under an allowlist policy | passes | **refuses** |
+| sets `hostNetwork: true` | **refuses** | passes any host list |
+| mounts a Secret the manifest never named | passes | **refuses** |
+
+The facet lives on the same `lex_os_manifest::Manifest`, in the slot
+[lex-os#71](https://github.com/alpibrusl/lex-os/issues/71) opened —
+lex-iac's `infra` facet was the first user, this is the second. One
+manifest, one `ManifestId`, one narrowing wall.
+
+### An empty allow-list grants nothing
+
+Not "unconstrained". A manifest that omits `secrets` authorises no
+Secret at all. That is the reading that fails safe, and the one an
+operator writing their first manifest expects least — so it is said
+here, in the CRD schema, and in the module docs.
+
+The exception is `imagePrefixes`, which cannot mean "no images" without
+refusing every pod. An empty list means provenance is not checked *by
+the manifest*, and an admitted pod says so in its `warnings` rather than
+passing silently. "We did not look" and "we looked and it was fine" are
+different facts.
+
+## `parent` is the wall Gatekeeper structurally lacks
+
+A `LexManifest` naming a parent is checked against it: a namespace lead
+hands out authority they hold, never authority they do not.
+
+```yaml
+spec:
+  parent: cluster/platform-default
+```
+
+A constraint language can only enumerate what is forbidden. It has
+nowhere to put *"and this policy is itself bounded by that one"*. That
+is the reason to build this rather than write more Gatekeeper
+constraints — and it is the claim to judge the project on.
+
+## A refusal is a typed record
+
+Kubernetes has a place for this that most webhooks do not use:
+`status.details.causes[]`. Each cause carries the wall, the reason, and
+the field — so `kubectl` shows an operator the line of YAML to change,
+and an agent gets something it can act on rather than a string to parse.
+
+```json
+{
+  "reason": "narrowing",
+  "message": "secret:root-ca-key: `Secret `root-ca-key`` is not among the 1 the manifest grants",
+  "field": "containers[api].env[K].valueFrom",
+  "grantAllows": ["stripe-live-key"]
+}
+```
+
+`grantAllows` is ours rather than Kubernetes'. It is a list because the
+point of a typed record is that a reader does not have to regex prose.
+
 ## Honest cautions
 
-1. **A webhook is only a wall if it cannot be bypassed.** That means
-   `failurePolicy: Fail` and an API server that enforces it. Anyone with
-   cluster-admin can delete the webhook; the audit chain records that
-   they did, it does not stop them.
-2. **The effect row is lossy, and that is structural.** Sidecars, CSI
+1. **A webhook is only a wall if it cannot be bypassed.** The shipped
+   `ValidatingWebhookConfiguration` uses `failurePolicy: Fail`, which is
+   not a tuning knob: under `Ignore`, a webhook outage means every pod is
+   admitted unchecked. The consequence belongs in your runbook — if this
+   webhook is down, admissions stop. And anyone with cluster-admin can
+   delete the object; the audit chain records that they did, it does not
+   stop them. The comparison to Gatekeeper is winnable on narrowing, not
+   on tamper-resistance.
+2. **`isolationFloor` is declared and not enforced here.** The
+   RuntimeClass that would back it is deliberately in another repo, so a
+   manifest asking for `microvm` is refused rather than accepted
+   silently — an operator must not come away believing a boundary exists
+   that does not. Spell it `unenforced-microvm` to say yes on purpose.
+3. **The effect row is lossy, and that is structural.** Sidecars, CSI
    drivers and operators act on the pod's behalf; the row captures what
    the spec *declares*, not what the node does. Bounding the rest needs
    the RuntimeClass, which is not in this repo and by design never will
    be.
-3. **Signing is asserted, not verified.** This crate has no keys, no
+4. **Signing is asserted, not verified.** This crate has no keys, no
    registry access, and no business doing crypto in an admission path.
    It records what the snapshot claims. Milestone 3 turns accepted
    admissions into attestations, and that is where trust is *earned*
    rather than declared.
-4. **The dangerous-capability list is a list, and lists are wrong.** A
+5. **The dangerous-capability list is a list, and lists are wrong.** A
    capability not on it still raises `exec`, to `sandboxed` rather than
    `full`. Getting the list wrong understates one pod; getting the
    default wrong would understate all of them.

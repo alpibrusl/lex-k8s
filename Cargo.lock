@@ -312,7 +312,20 @@ name = "lex-k8s"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "lex-os-audit",
  "lex-os-manifest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "lex-os-audit"
+version = "0.1.0"
+source = "git+https://github.com/alpibrusl/lex-os?rev=383776c0056794a4b7a336199f3cc16051bd5ec9#383776c0056794a4b7a336199f3cc16051bd5ec9"
+dependencies = [
+ "hex",
  "serde",
  "serde_json",
  "sha2",
