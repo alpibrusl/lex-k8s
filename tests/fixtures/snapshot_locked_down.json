@@ -1,0 +1,10 @@
+{
+  "egress": {
+    "policy_names": ["payments-egress"],
+    "cidrs": ["10.42.0.0/16"],
+    "selectors": ["namespace=payments"]
+  },
+  "rbac": [],
+  "trusted_image_prefixes": ["registry.internal/"],
+  "provenance": { "networkpolicies.resourceVersion": "884213", "capturedAt": "2026-09-06T14:40:00Z" }
+}

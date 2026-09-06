@@ -1,0 +1,5 @@
+{
+  "rbac": [],
+  "trusted_image_prefixes": ["registry.internal/"],
+  "provenance": { "note": "no NetworkPolicy selects this pod" }
+}
