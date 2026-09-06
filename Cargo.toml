@@ -1,0 +1,25 @@
+[package]
+name = "lex-k8s"
+description = "A validating admission wall for Kubernetes: compiles a PodSpec to typed effect rows and refuses what the namespace's grant does not cover."
+version = "0.1.0"
+edition = "2021"
+license = "EUPL-1.2"
+repository = "https://github.com/alpibrusl/lex-k8s"
+homepage = "https://github.com/alpibrusl/lex-k8s"
+authors = ["Alpibrupa <https://github.com/alpibrupa>"]
+keywords = ["kubernetes", "admission", "policy", "capability", "lex"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+# The trust lattice is the point: a PodSpec compiles to a `Grant`, which
+# is the same type a manifest grants and the same type `lex-os-check`
+# holds a `.lex` program to. Depending on it beats inventing a parallel
+# vocabulary that must not drift. Pinned to a rev, per the house style
+# for lex-os -> lex-lang.
+lex-os-manifest = { git = "https://github.com/alpibrusl/lex-os", rev = "383776c0056794a4b7a336199f3cc16051bd5ec9" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+hex = "0.4"
+thiserror = "2"
