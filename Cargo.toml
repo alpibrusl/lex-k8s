@@ -16,11 +16,11 @@ categories = ["command-line-utilities", "development-tools"]
 # holds a `.lex` program to. Depending on it beats inventing a parallel
 # vocabulary that must not drift. Pinned to a rev, per the house style
 # for lex-os -> lex-lang.
-lex-os-manifest = { git = "https://github.com/alpibrusl/lex-os", rev = "383776c0056794a4b7a336199f3cc16051bd5ec9" }
+lex-os-manifest = { git = "https://github.com/alpibrusl/lex-os", rev = "8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30" }
 # The tamper-evident chain, carrying this wall's own vocabulary. lex-os
 # made `Chain<E>` generic (lex-os#67) precisely so a downstream gate does
 # not reimplement it; lex-iac was the first consumer, this is the second.
-lex-os-audit = { git = "https://github.com/alpibrusl/lex-os", rev = "383776c0056794a4b7a336199f3cc16051bd5ec9" }
+lex-os-audit = { git = "https://github.com/alpibrusl/lex-os", rev = "8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

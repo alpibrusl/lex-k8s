@@ -296,8 +296,8 @@ dependencies = [
 
 [[package]]
 name = "lex-ast"
-version = "0.10.15"
-source = "git+https://github.com/alpibrusl/lex-lang?tag=v0.10.15#f2c872fedffd72c4e35d36f1714cae11e826c3df"
+version = "0.10.16"
+source = "git+https://github.com/alpibrusl/lex-lang?tag=v0.10.16#91363a459cbdfe394de018cb3dc70619bfde6c58"
 dependencies = [
  "indexmap",
  "lex-syntax",
@@ -323,7 +323,7 @@ dependencies = [
 [[package]]
 name = "lex-os-audit"
 version = "0.1.0"
-source = "git+https://github.com/alpibrusl/lex-os?rev=383776c0056794a4b7a336199f3cc16051bd5ec9#383776c0056794a4b7a336199f3cc16051bd5ec9"
+source = "git+https://github.com/alpibrusl/lex-os?rev=8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30#8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30"
 dependencies = [
  "hex",
  "serde",
@@ -335,7 +335,7 @@ dependencies = [
 [[package]]
 name = "lex-os-manifest"
 version = "0.1.0"
-source = "git+https://github.com/alpibrusl/lex-os?rev=383776c0056794a4b7a336199f3cc16051bd5ec9#383776c0056794a4b7a336199f3cc16051bd5ec9"
+source = "git+https://github.com/alpibrusl/lex-os?rev=8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30#8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30"
 dependencies = [
  "hex",
  "lex-types",
@@ -347,8 +347,8 @@ dependencies = [
 
 [[package]]
 name = "lex-syntax"
-version = "0.10.15"
-source = "git+https://github.com/alpibrusl/lex-lang?tag=v0.10.15#f2c872fedffd72c4e35d36f1714cae11e826c3df"
+version = "0.10.16"
+source = "git+https://github.com/alpibrusl/lex-lang?tag=v0.10.16#91363a459cbdfe394de018cb3dc70619bfde6c58"
 dependencies = [
  "flate2",
  "indexmap",
@@ -364,12 +364,13 @@ dependencies = [
 
 [[package]]
 name = "lex-types"
-version = "0.10.15"
-source = "git+https://github.com/alpibrusl/lex-lang?tag=v0.10.15#f2c872fedffd72c4e35d36f1714cae11e826c3df"
+version = "0.10.16"
+source = "git+https://github.com/alpibrusl/lex-lang?tag=v0.10.16#91363a459cbdfe394de018cb3dc70619bfde6c58"
 dependencies = [
  "hex",
  "indexmap",
  "lex-ast",
+ "lex-syntax",
  "serde",
  "serde_json",
  "sha2",
