@@ -16,11 +16,16 @@ categories = ["command-line-utilities", "development-tools"]
 # holds a `.lex` program to. Depending on it beats inventing a parallel
 # vocabulary that must not drift. Pinned to a rev, per the house style
 # for lex-os -> lex-lang.
-lex-os-manifest = { git = "https://github.com/alpibrusl/lex-os", rev = "8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30" }
+lex-os-manifest = { git = "https://github.com/alpibrusl/lex-os", rev = "1f892d4ae33eae3665ad9a8bd1f84777fb7bda28" }
 # The tamper-evident chain, carrying this wall's own vocabulary. lex-os
 # made `Chain<E>` generic (lex-os#67) precisely so a downstream gate does
 # not reimplement it; lex-iac was the first consumer, this is the second.
-lex-os-audit = { git = "https://github.com/alpibrusl/lex-os", rev = "8ed9cdb33d7db82db5bbdca11d52bfbaedf60e30" }
+#
+# Pinned past lex-os#54, which added Ed25519 seals to the chain. That
+# matters more here than anywhere: this wall writes its chains to a pod's
+# own filesystem, which is the weakest place any consumer of `Chain<E>`
+# has put one.
+lex-os-audit = { git = "https://github.com/alpibrusl/lex-os", rev = "1f892d4ae33eae3665ad9a8bd1f84777fb7bda28" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -39,7 +39,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 use crate::admission::Spend;
-use crate::{Keyring, PriceList, SpendReport};
+use crate::{Keyring, PriceList, SigningKey, SpendReport};
 
 /// Everything `serve` needs that is not in the cluster.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +51,11 @@ pub struct Options {
     pub prices: Option<PathBuf>,
     pub spend: Option<PathBuf>,
     pub audit_dir: Option<PathBuf>,
+    /// Seals every decision's chain (lex-os#54). A path, not a hex
+    /// string: this is a long-running process, and a secret in argv is
+    /// a secret in `ps` for as long as the pod lives. Mount it from a
+    /// Secret.
+    pub audit_key_file: Option<PathBuf>,
     pub trusted_image_prefixes: Vec<String>,
     /// Where `parent: cluster/<name>` resolves. Defaults to
     /// `lex-system`.
@@ -131,6 +136,41 @@ pub async fn run(opts: Options) -> Result<(), ServeError> {
         std::fs::create_dir_all(dir)?;
     }
 
+    // Read before anything serves. A wall that was meant to seal its
+    // decisions and silently did not is worse than one that refused to
+    // start — the log would look fine right up until somebody needed it
+    // to prove something.
+    let audit_key = match &opts.audit_key_file {
+        None => {
+            if opts.audit_dir.is_some() {
+                tracing::warn!(
+                    "writing an UNSEALED decision log: anyone who can reach the volume can \
+                     rewrite a refusal into an admission and recompute the hashes. Pass \
+                     --audit-key-file to seal it (lex-os#54)"
+                );
+            }
+            None
+        }
+        Some(p) => {
+            let hex_key = read(p)?;
+            let bytes: [u8; 32] = hex::decode(hex_key.trim())
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .ok_or_else(|| {
+                    ServeError::Input(format!(
+                        "{}: the audit signing key must be 32 hex-encoded bytes",
+                        p.display()
+                    ))
+                })?;
+            let key = SigningKey::from_bytes(&bytes);
+            tracing::info!(
+                signer = %hex::encode(key.verifying_key().to_bytes()),
+                "sealing every decision"
+            );
+            Some(Arc::new(key))
+        }
+    };
+
     // Before the client, deliberately: a certificate the process cannot
     // read is a configuration error, and finding it out after six
     // reflectors have started listing the cluster wastes an API server's
@@ -153,6 +193,7 @@ pub async fn run(opts: Options) -> Result<(), ServeError> {
         spend,
         trusted_image_prefixes: opts.trusted_image_prefixes.clone(),
         audit_dir: opts.audit_dir.clone(),
+        audit_key,
         root_namespace: opts
             .root_namespace
             .clone()
