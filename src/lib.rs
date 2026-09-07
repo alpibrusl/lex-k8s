@@ -39,12 +39,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use admission::{
-    admit, AdmissionError, AdmissionEvent, Decision, Refusal, RequestMeta, Verdict, Wall,
+    admit, admit_sealed, AdmissionError, AdmissionEvent, Decision, Refusal, RequestMeta, Verdict,
+    Wall,
 };
+// Re-exported so a consumer sealing this wall's chains needs no direct
+// dependency on ed25519 — two crates on two versions of it would stop
+// verifying each other's logs.
 pub use cluster::{ClusterSnapshot, EgressPolicy, RbacRule};
 pub use cost::{CostError, PodReservation, PriceList, Reservation, SpendReport, Undeclared};
 pub use effect::{Effect, ImageDoubt, Reach, SecretVia, Source};
 pub use facet::{Denial, PodFacet};
+pub use lex_os_audit::{Chain, Checkpoint, SigningKey, VerifyingKey};
 pub use lex_os_manifest::{Grant, Level, Reversibility};
 pub use manifest::{narrow, pod_facet, LexManifest, ManifestReadError};
 pub use review::{respond, AdmissionRequest, AdmissionReview, ReviewError};

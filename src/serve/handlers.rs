@@ -27,7 +27,7 @@ use crate::admission::Spend;
 use crate::review::cannot_run;
 use crate::serve::cache::{contents, Caches, ManifestLookup};
 use crate::serve::snapshot::{self, PodSubject};
-use crate::{admit, narrow, respond, AdmissionReview, Keyring, LexManifest, Verdict};
+use crate::{admit, admit_sealed, narrow, respond, AdmissionReview, Keyring, LexManifest, Verdict};
 
 /// What the server holds for the life of the process.
 #[derive(Clone)]
@@ -48,6 +48,8 @@ pub struct Wall {
     pub trusted_image_prefixes: Vec<String>,
     /// Where each decision's hash chain is written, if anywhere.
     pub audit_dir: Option<std::path::PathBuf>,
+    /// Seals every decision's chain, when the operator mounted a key.
+    pub audit_key: Option<Arc<crate::SigningKey>>,
     /// Where `parent: cluster/<name>` looks. See
     /// [`Caches::manifest_by_reference`].
     pub root_namespace: String,
@@ -170,19 +172,30 @@ pub async fn admit_pod(State(wall): State<Wall>, body: String) -> Response {
         wall.trusted_image_prefixes.clone(),
     );
 
-    let decision = match admit(
-        &request.object_json(),
-        &manifest,
-        &snap,
-        // The submitter is the API server's authenticated
-        // `userInfo.username`, carried through `meta()` — never a
-        // header, a flag or a body field. A webhook that let its caller
-        // name the submitter would let any submitter spend another's
-        // record.
-        &request.meta(),
-        wall.keyring.as_deref(),
-        wall.spend.as_deref(),
-    ) {
+    // The submitter is the API server's authenticated
+    // `userInfo.username`, carried through `meta()` — never a header, a
+    // flag or a body field. A webhook that let its caller name the
+    // submitter would let any submitter spend another's record.
+    let meta = request.meta();
+    let decision = match match &wall.audit_key {
+        Some(k) => admit_sealed(
+            &request.object_json(),
+            &manifest,
+            &snap,
+            &meta,
+            wall.keyring.as_deref(),
+            wall.spend.as_deref(),
+            k,
+        ),
+        None => admit(
+            &request.object_json(),
+            &manifest,
+            &snap,
+            &meta,
+            wall.keyring.as_deref(),
+            wall.spend.as_deref(),
+        ),
+    } {
         Ok(d) => d,
         Err(e) => return failed(&uid, &e.to_string()),
     };
@@ -218,6 +231,7 @@ pub async fn admit_pod(State(wall): State<Wall>, body: String) -> Response {
         snapshot = %snap.content_id(),
         audit_head = %decision.audit.head(),
         entries = decision.audit.len(),
+        sealed = decision.audit.sealed_count() == decision.audit.len(),
         "decided"
     );
 

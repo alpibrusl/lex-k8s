@@ -35,7 +35,7 @@
 //! judged against — rather than a message to parse. That is the
 //! `RepairHint` shape the epic asks for.
 
-use lex_os_audit::{Chain, ChainPayload};
+use lex_os_audit::{Chain, ChainPayload, SigningKey};
 use lex_os_manifest::{Grant, Manifest};
 use serde::{Deserialize, Serialize};
 
@@ -272,6 +272,64 @@ pub fn admit(
     keyring: Option<&Keyring>,
     spend: Option<&Spend>,
 ) -> Result<Decision, AdmissionError> {
+    admit_inner(spec_json, manifest, snapshot, request, keyring, spend, None)
+}
+
+/// [`admit`], with every audit entry sealed by `key` (lex-os#54).
+///
+/// A separate entry point rather than a seventh argument on `admit`,
+/// because there are exactly two callers that seal — the CLI and the
+/// webhook — and forty that do not care. lex-os put the key on the
+/// chain because it had twenty `append` sites that could each forget;
+/// this crate has one place a chain is built, so naming the sealed path
+/// is enough.
+///
+/// # Why this matters more here than upstream
+///
+/// This wall writes its chains to the **pod's own filesystem**, which is
+/// the weakest place any consumer of `Chain<E>` has put one. Without a
+/// seal, whoever can reach that volume can rewrite a refusal into an
+/// admission and recompute the hashes, and the result verifies.
+///
+/// # What a seal still does not fix here
+///
+/// Each admission gets its **own** chain, so there is no tail to
+/// truncate — and equally, **deleting a whole decision file is
+/// invisible**. That is the same gap one level up, and a checkpoint
+/// cannot close it: you cannot commit to the length of a set of files
+/// nobody is counting. Closing it needs a running ledger of decision
+/// heads; see the README's cautions.
+#[allow(clippy::too_many_arguments)]
+pub fn admit_sealed(
+    spec_json: &str,
+    manifest: &Manifest,
+    snapshot: &ClusterSnapshot,
+    request: &RequestMeta,
+    keyring: Option<&Keyring>,
+    spend: Option<&Spend>,
+    key: &SigningKey,
+) -> Result<Decision, AdmissionError> {
+    admit_inner(
+        spec_json,
+        manifest,
+        snapshot,
+        request,
+        keyring,
+        spend,
+        Some(key),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_inner(
+    spec_json: &str,
+    manifest: &Manifest,
+    snapshot: &ClusterSnapshot,
+    request: &RequestMeta,
+    keyring: Option<&Keyring>,
+    spend: Option<&Spend>,
+    audit_key: Option<&SigningKey>,
+) -> Result<Decision, AdmissionError> {
     let pod = crate::compile_str(spec_json, snapshot)?;
     let facet = pod_facet(manifest).map_err(|e| AdmissionError::Manifest(e.to_string()))?;
     let manifest_id = manifest.content_id().0;
@@ -286,7 +344,14 @@ pub fn admit(
     };
     let subject = format!("{}/{}", request.namespace, request.name);
 
-    let mut audit: Chain<AdmissionEvent> = Chain::new();
+    // Sealed before the first append, so there is no window in which an
+    // entry is written unsealed — including the request entry, which is
+    // logged before any wall runs and is therefore the one an
+    // after-the-fact editor would most like to be missing.
+    let mut audit: Chain<AdmissionEvent> = match audit_key {
+        Some(k) => Chain::new().sealed_with(k.clone()),
+        None => Chain::new(),
+    };
     audit.append(AdmissionEvent::PodRequested {
         uid: request.uid.clone(),
         namespace: request.namespace.clone(),

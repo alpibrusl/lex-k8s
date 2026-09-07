@@ -162,7 +162,9 @@ calls:
 6. the audit chains, one per pod admission
 7. the wall is scaled to zero and admissions **stop** — `failurePolicy:
    Fail` doing its job, on a pod that was admitted a moment earlier
-8. what the restart cost the record — see caution 9
+8. a refusal is rewritten into an admission and the chain rebuilt — the
+   chain accepts it, **the seal refuses it**
+9. what the restart cost the record — see caution 9
 
 ### How it is wired
 
@@ -186,6 +188,38 @@ permission.
 Serving is behind the `serve` feature so the decision half stays cheap
 to depend on. A binary built without it says so rather than starting
 something weaker.
+
+### Sealing the decision log
+
+This wall writes its chains to the **pod's own filesystem**, which is the
+weakest place any consumer of lex-os's `Chain<E>` puts one. A hash chain
+is tamper-*evident* only against someone who cannot recompute it — and
+the hashes are derived from the contents, so whoever can reach that
+volume can rewrite a refusal into an admission, rebuild every hash, and
+hand you a log that verifies perfectly.
+
+`--audit-key-file` seals every entry with Ed25519
+([alpibrusl/lex-os#54](https://github.com/alpibrusl/lex-os/issues/54)),
+which is the part they cannot recompute:
+
+```sh
+lex-k8s audit pubkey --key-file audit.key          # the half a verifier needs
+lex-k8s audit verify --log decision.json           # the chain only
+lex-k8s audit verify --log decision.json --trusted-key <public-hex>
+```
+
+Step 8 of the demo runs exactly that attack — `demo/forge-verdict.py`
+needs no key and no privilege, only the file — and shows the chain
+accepting it and the seal refusing it. Sealing is opt-in, and an
+unsealed log is reported as unsealed rather than as passing: the wall
+warns loudly at startup if it is writing one, and `audit verify` says
+`NOT CHECKED` rather than `OK` when you give it no key.
+
+**What sealing does not close here.** Each admission gets its own chain,
+so there is no tail to truncate — and equally, **deleting a whole
+decision file leaves no gap to notice**. A checkpoint cannot help:
+you cannot commit to the length of a set of files nobody is counting.
+That needs one running ledger of decision heads, and it is not built.
 
 ## The effect model
 
@@ -557,14 +591,16 @@ point of a typed record is that a reader does not have to regex prose.
    capability not on it still raises `exec`, to `sandboxed` rather than
    `full`. Getting the list wrong understates one pod; getting the
    default wrong would understate all of them.
-9. **The audit chain lives inside the thing it audits.** It is written
-   to the pod's own volume, unsigned — so a pod that restarts takes its
-   history with it, and a compromised one can rewrite it. Step 8 of the
-   demo shows exactly that happening rather than hiding it. The head of
-   every chain also goes to stdout, which is the part a log collector
-   keeps today. The fix is signed entries and storage the box cannot
-   reach: [alpibrusl/lex-os#54](https://github.com/alpibrusl/lex-os/issues/54),
-   upstream, where both gates get it at once.
+9. **The audit chain lives inside the thing it audits, and only half of
+   that is fixed.** Entries are now sealed, so a decision cannot be
+   *rewritten* by whoever holds the volume — step 8 of the demo proves
+   it. Nothing stops one being *deleted*: each admission gets its own
+   chain, so a missing file leaves no gap, and a checkpoint cannot
+   commit to the length of a set of files nobody counts. Step 9 shows a
+   restart taking the record with it. Closing that needs a running
+   ledger of decision heads written somewhere the pod does not own. The
+   head of every chain also goes to stdout, which is what a log
+   collector keeps today.
 10. **`/narrow` decides without a chain of its own.** Manifest verdicts
     reach the log but not the audit record — the chain's vocabulary is
     pod-shaped. A manifest that widens its parent is the more

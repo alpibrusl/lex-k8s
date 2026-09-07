@@ -42,6 +42,12 @@ spec:
             - --key=/tls/tls.key
             - --addr=0.0.0.0:8443
             - --audit-dir=/audit
+            # The chain is tamper-*evident* only against someone who
+            # cannot recompute it, and whoever can reach /audit can:
+            # the hashes are derived. The seal is the part they cannot
+            # forge (lex-os#54). Without this flag the wall still runs
+            # and says loudly that the log is unsealed.
+            - --audit-key-file=/audit-key/audit.key
           env:
             - name: RUST_LOG
               value: lex_k8s=info,kube=warn
@@ -59,6 +65,9 @@ spec:
               readOnly: true
             - name: audit
               mountPath: /audit
+            - name: audit-key
+              mountPath: /audit-key
+              readOnly: true
           # `/readyz` is 503 until every cache has listed once, which
           # keeps this pod out of the Service's endpoints until the wall
           # can actually decide. An empty cache reads as "no
@@ -91,3 +100,10 @@ spec:
         # can keep today.
         - name: audit
           emptyDir: {}
+        # The signing key. Whoever holds it can seal a decision, so it is
+        # the wall's identity rather than a configuration value: mount it
+        # read-only, to this workload only, and rotate it the way you
+        # would rotate a serving certificate.
+        - name: audit-key
+          secret:
+            secretName: lex-k8s-audit-key

@@ -22,6 +22,7 @@ note() { printf '  %s\n' "$*"; }
 fail() { printf '\n\033[31mFAILED: %s\033[0m\n' "$*" >&2; exit 1; }
 
 cleanup() {
+  rm -rf "${WORKDIR:-}"
   if [ "$KEEP" = "1" ]; then
     bold "cluster $CLUSTER left up (KEEP=1). Delete it with: kind delete cluster --name $CLUSTER"
   else
@@ -29,6 +30,13 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+# A host build for the verification half of step 8: the wall runs in the
+# cluster, but checking what it wrote is something an operator does from
+# outside, with only the public key.
+WORKDIR=$(mktemp -d)
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml"
+LEXK8S="$ROOT/target/debug/lex-k8s"
 
 bold "0. cluster, image, CRD, webhook"
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
@@ -46,6 +54,16 @@ kubectl apply -f "$ROOT/deploy/service.yaml" >/dev/null
 
 CA_BUNDLE=$(NS=lex-system SERVICE=lex-k8s "$ROOT/deploy/bootstrap-certs.sh")
 note "serving certificate minted; CA is ${#CA_BUNDLE} bytes of base64"
+
+# The audit signing key (lex-os#54). Deterministic here so the demo can
+# print the public half; a real deployment generates one and keeps the
+# secret in a Secret nobody mounts twice.
+AUDIT_SK=$(printf '07%.0s' $(seq 1 32))
+kubectl -n lex-system delete secret lex-k8s-audit-key --ignore-not-found >/dev/null
+kubectl -n lex-system create secret generic lex-k8s-audit-key \
+  --from-literal=audit.key="$AUDIT_SK" >/dev/null
+AUDIT_PK=$("$LEXK8S" audit pubkey --key "$AUDIT_SK")
+note "audit signing key mounted; decisions will be sealed by ${AUDIT_PK:0:16}…"
 
 kubectl apply -f "$ROOT/deploy/deployment.yaml" >/dev/null
 kubectl -n lex-system rollout status deploy/lex-k8s --timeout=180s >/dev/null
@@ -173,21 +191,51 @@ for i in $(seq 1 60); do
 done
 note "wall back up; the same pod is admitted again"
 
-bold "8. what the restart cost the record"
-NEW_POD=$(kubectl -n lex-system get pod -l app=lex-k8s -o jsonpath='{.items[0].metadata.name}')
-AFTER=$(kubectl -n lex-system exec "$NEW_POD" -- sh -c 'ls /audit | wc -l' | tr -d ' \r')
+bold "8. the decision log is sealed"
+# The chain alone is tamper-*evident* only against someone who cannot
+# recompute it — and whoever can reach this volume can, because the
+# hashes are derived. The seal is the part they cannot forge.
+# A fresh pod name: step 7 restarted the Deployment, so the one captured
+# in step 6 is gone.
+POD=$(kubectl -n lex-system get pod -l app=lex-k8s -o jsonpath='{.items[0].metadata.name}')
+# ...and a fresh *refusal*, because refusal-to-admission is the forgery
+# worth demonstrating. Nobody rewrites a log to make themselves look
+# worse.
+kubectl apply -f "$ROOT/demo/manifests/11-pod-beyond.yaml" >/dev/null 2>&1 || true
+CHAIN=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls -t /audit | head -1' | tr -d '\r')
+kubectl -n lex-system exec "$POD" -- cat "/audit/$CHAIN" > "$WORKDIR/decision.json"
+"$LEXK8S" audit verify --log "$WORKDIR/decision.json" --trusted-key "$AUDIT_PK" | sed 's/^/  | /'
+
+# And the attack: rewrite the verdict, rebuild the chain (free — the
+# hashes are derived), and watch the chain accept it and the seal not.
+python3 "$ROOT/demo/forge-verdict.py" "$WORKDIR/decision.json" "$WORKDIR/forged.json"
+if "$LEXK8S" audit verify --log "$WORKDIR/forged.json" >/dev/null 2>&1; then
+  note "the chain alone accepts the forged log — which is the whole point"
+else
+  fail "the forgery should be indistinguishable to the chain alone"
+fi
+if "$LEXK8S" audit verify --log "$WORKDIR/forged.json" --trusted-key "$AUDIT_PK" 2>&1 \
+     | sed 's/^/  | /'; then
+  fail "the seal must refuse a rewritten decision"
+fi
+note "sealed: a rewritten verdict passes the chain and fails the seal."
+
+bold "9. what the restart cost the record"
+AFTER=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls /audit | wc -l' | tr -d ' \r')
 note "before the restart: $CHAINS chains. After it: $AFTER."
 [ "${AFTER:-0}" -lt "${CHAINS:-0}" ] \
   || fail "expected the restart to lose the local chains; this step is the honest one"
-# Not a bug in this demo — the gap it exists to show. The chain is
-# tamper-evident but locally persisted and unsigned, so a pod that
-# restarts (or is compromised) takes its own history with it. Fixing it
-# means signed entries and storage the box cannot reach, which is
-# alpibrusl/lex-os#54, upstream, where both gates get it at once.
-note "the earlier chains went with the pod. Tamper-evident is not tamper-proof when"
-note "the log lives inside the thing it is auditing — alpibrusl/lex-os#54."
-note "The heads printed on stdout above are the part a collector keeps today."
+# Not a bug in this demo — the gap it exists to show, and the half that
+# sealing does *not* close. Step 8 proved nobody can rewrite a decision.
+# Nothing proves a decision that once existed still does: each admission
+# gets its own chain, so a deleted file leaves no gap to notice, and a
+# checkpoint cannot help — you cannot commit to the length of a set of
+# files nobody is counting.
+note "the earlier chains went with the pod. Sealing stops a decision being"
+note "rewritten; it does not stop one being deleted, because there is no"
+note "running ledger to show a gap. That needs one chain across decisions."
+note "The heads printed on stdout above are what a collector keeps today."
 
 bold "the wall ran in a cluster."
-note "Eight steps, no mock: a real API server called a real webhook over TLS,"
+note "Nine steps, no mock: a real API server called a real webhook over TLS,"
 note "and every verdict came from the same admit()/narrow() the CLI calls."

@@ -29,20 +29,25 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use lex_k8s::{
-    admission::Spend, admit, narrow, respond, review::cannot_run, AdmissionReview, ClusterSnapshot,
-    Keyring, LexManifest, PriceList, Reversibility, SpendReport, Standing, Verdict,
+    admission::Spend, admit, narrow, respond, review::cannot_run, AdmissionEvent, AdmissionReview,
+    Chain, ClusterSnapshot, Keyring, LexManifest, PriceList, Reversibility, SigningKey,
+    SpendReport, Standing, Verdict, VerifyingKey,
 };
 
 const USAGE: &str = "\
 usage:
   lex-k8s admit    --manifest <LexManifest.json> [--snapshot <cluster.json>]
                    [--trusted-keys <keyring.json>] [--prices <prices.json>]
-                   [--spend <spend.json>] [--audit-out <log.json>] < review.json
+                   [--spend <spend.json>] [--audit-out <log.json>]
+                   [--audit-key <hex> | --audit-key-file <path>] < review.json
   lex-k8s compile  --pod <pod.json> [--snapshot <cluster.json>]
   lex-k8s manifest narrow --parent <LexManifest.json> --child <LexManifest.json>
+  lex-k8s audit verify --log <audit.json> [--trusted-key <hex>]...
+  lex-k8s audit pubkey [--key <hex> | --key-file <path>]
   lex-k8s serve    --cert <tls.crt> --key <tls.key> [--addr 0.0.0.0:8443]
                    [--trusted-keys <keyring.json>] [--prices <prices.json>]
                    [--spend <spend.json>] [--audit-dir <dir>]
+                   [--audit-key-file <path>]
                    [--trusted-image-prefix <prefix>]... [--root-namespace <ns>]
 
 `admit` reads an AdmissionReview on stdin and writes the response on stdout.
@@ -61,6 +66,12 @@ this refuses new admissions only, and never evicts a running pod.
 
 --audit-out writes the hash-chained decision log, which is the input to
 `lex attest import-apply --accepted pod_admitted --refused pod_refused`.
+
+--audit-key/--audit-key-file seals every entry of that log with an Ed25519
+key (lex-os#54). The hash chain is derived, so whoever can reach the file
+can rewrite a refusal into an admission and recompute the hashes; the seal
+is the part they cannot forge. `audit verify --trusted-key <public hex>`
+is what checks it. Prefer the file: a secret in argv is a secret in `ps`.
 
 Without --snapshot the cluster is read as having no NetworkPolicy, which in
 Kubernetes means unrestricted egress — not none.
@@ -82,6 +93,8 @@ fn main() -> ExitCode {
         ["admit", rest @ ..] => cmd_admit(rest),
         ["compile", rest @ ..] => cmd_compile(rest),
         ["manifest", "narrow", rest @ ..] => cmd_narrow(rest),
+        ["audit", "verify", rest @ ..] => cmd_audit_verify(rest),
+        ["audit", "pubkey", rest @ ..] => cmd_audit_pubkey(rest),
         ["serve", rest @ ..] => cmd_serve(rest),
         ["--help"] | ["-h"] | [] => {
             println!("{USAGE}");
@@ -293,14 +306,34 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
         }
     };
 
-    let decision = match admit(
-        &request.object_json(),
-        &manifest,
-        &snap,
-        &request.meta(),
-        keyring.as_ref(),
-        spend.as_ref(),
-    ) {
+    let audit_key =
+        match load_signing_key(flag(args, "--audit-key"), flag(args, "--audit-key-file")) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::from(2);
+            }
+        };
+
+    let decision = match match &audit_key {
+        Some(k) => lex_k8s::admit_sealed(
+            &request.object_json(),
+            &manifest,
+            &snap,
+            &request.meta(),
+            keyring.as_ref(),
+            spend.as_ref(),
+            k,
+        ),
+        None => admit(
+            &request.object_json(),
+            &manifest,
+            &snap,
+            &request.meta(),
+            keyring.as_ref(),
+            spend.as_ref(),
+        ),
+    } {
         Ok(d) => d,
         Err(e) => {
             // Answer the API server rather than dying silently: with
@@ -379,9 +412,14 @@ fn cmd_admit(args: &[&str]) -> ExitCode {
         }
     }
     eprintln!(
-        "audit: {} entries, head sha256:{}",
+        "audit: {} entries, head sha256:{}{}",
         decision.audit.len(),
-        decision.audit.head()
+        decision.audit.head(),
+        if decision.audit.sealed_count() == decision.audit.len() && !decision.audit.is_empty() {
+            " (sealed)"
+        } else {
+            " (UNSEALED — anyone who can reach the file can rewrite it)"
+        }
     );
     ExitCode::from(decision.exit_code() as u8)
 }
@@ -509,6 +547,7 @@ fn cmd_serve(args: &[&str]) -> ExitCode {
         prices: flag(args, "--prices").map(PathBuf::from),
         spend: flag(args, "--spend").map(PathBuf::from),
         audit_dir: flag(args, "--audit-dir").map(PathBuf::from),
+        audit_key_file: flag(args, "--audit-key-file").map(PathBuf::from),
         trusted_image_prefixes,
         root_namespace: flag(args, "--root-namespace").map(str::to_string),
     };
@@ -553,6 +592,145 @@ fn cmd_serve(_args: &[&str]) -> ExitCode {
          stdin — the decision is identical either way."
     );
     ExitCode::from(2)
+}
+
+/// `audit pubkey` — the public half of an audit signing key.
+///
+/// An operator seals with the secret and verifies with the public key,
+/// and those are different 32-byte hex strings. Deriving it here beats
+/// having them keep track of a pair by hand, or — worse — reach for the
+/// secret when a verifier asks for a key.
+fn cmd_audit_pubkey(args: &[&str]) -> ExitCode {
+    match load_signing_key(flag(args, "--key"), flag(args, "--key-file")) {
+        Ok(Some(k)) => {
+            println!("{}", hex::encode(k.verifying_key().to_bytes()));
+            ExitCode::from(0)
+        }
+        Ok(None) => {
+            eprintln!("audit pubkey needs --key or --key-file\n\n{USAGE}");
+            ExitCode::from(2)
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Read a 32-byte hex signing key from a flag or a file.
+///
+/// Both spellings, and the file is the one to use: a secret in argv is a
+/// secret in `ps` output and in shell history, and an audit key that
+/// leaks is an audit log anyone can re-sign.
+fn load_signing_key(
+    key: Option<&str>,
+    key_file: Option<&str>,
+) -> Result<Option<SigningKey>, String> {
+    let hex_key = match (key, key_file) {
+        (None, None) => return Ok(None),
+        (Some(k), _) => k.to_string(),
+        (None, Some(p)) => std::fs::read_to_string(p)
+            .map_err(|e| format!("cannot read {p}: {e}"))?
+            .trim()
+            .to_string(),
+    };
+    decode_key32(&hex_key).map(|b| Some(SigningKey::from_bytes(&b)))
+}
+
+fn decode_key32(hex_key: &str) -> Result<[u8; 32], String> {
+    hex::decode(hex_key.trim())
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .ok_or_else(|| format!("`{hex_key}` is not 32 hex-encoded bytes"))
+}
+
+/// `audit verify` — the chain always, the seals when you supply a key.
+///
+/// Two walls, reported separately, because they catch different things
+/// and a single `verified: true` would let a reader believe the log was
+/// held to one nobody asked for:
+///
+/// - the **chain** catches an edited payload and a reordered entry, but
+///   not a holder who edits and then recomputes every hash;
+/// - the **seals** catch exactly that holder.
+///
+/// Supplying no key checks no seals, and says so rather than passing.
+fn cmd_audit_verify(args: &[&str]) -> ExitCode {
+    let Some(path) = flag(args, "--log") else {
+        eprintln!("audit verify needs --log\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let src = match read(path) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let log: Chain<AdmissionEvent> = match Chain::from_json(&src) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("could not read the audit log {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if let Err(e) = log.verify() {
+        println!("REFUSED — the hash chain is broken.");
+        println!("  {e}");
+        return ExitCode::from(8);
+    }
+
+    let trusted_hex = flags(args, "--trusted-key");
+    if trusted_hex.is_empty() {
+        println!(
+            "chain:  OK — {} entries, head sha256:{}",
+            log.len(),
+            log.head()
+        );
+        // Not a pass. A log whose seals nobody checked is not a log
+        // whose seals passed, and on this wall the file lives inside the
+        // pod it audits.
+        println!(
+            "seals:  NOT CHECKED — {} of {} entries carry one.",
+            log.sealed_count(),
+            log.len()
+        );
+        println!("        Pass --trusted-key <hex> to hold them to it.");
+        return ExitCode::from(0);
+    }
+
+    let mut trusted = Vec::new();
+    for h in &trusted_hex {
+        match decode_key32(h).and_then(|b| {
+            VerifyingKey::from_bytes(&b).map_err(|_| format!("`{h}` is not an Ed25519 public key"))
+        }) {
+            Ok(k) => trusted.push(k),
+            Err(e) => {
+                eprintln!("--trusted-key {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    match log.verify_seals(&trusted) {
+        Ok(()) => {
+            println!(
+                "chain:  OK — {} entries, head sha256:{}",
+                log.len(),
+                log.head()
+            );
+            println!("seals:  OK — every entry sealed by a trusted key.");
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            println!("REFUSED — the seals do not hold.");
+            println!("  {e}");
+            println!(
+                "\nA broken seal on an intact chain is the interesting case: it means \n\
+                 somebody edited the log and recomputed the hashes. That is what the \n\
+                 chain alone cannot see."
+            );
+            ExitCode::from(8)
+        }
+    }
 }
 
 #[cfg(test)]
