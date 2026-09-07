@@ -29,6 +29,9 @@ pub mod effect;
 pub mod facet;
 pub mod manifest;
 pub mod review;
+/// The webhook. Feature-gated: see `src/serve/mod.rs` for why.
+#[cfg(feature = "serve")]
+pub mod serve;
 pub mod spec;
 pub mod trust;
 

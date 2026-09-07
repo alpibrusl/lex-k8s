@@ -1,0 +1,93 @@
+# The wall itself.
+#
+# # One replica, and that is a caution rather than a setting
+#
+# Each replica keeps its own watch caches, and two caches can disagree
+# for a moment after a NetworkPolicy changes — so two replicas can give
+# two verdicts for the same pod. One replica is honest for a demo and
+# dishonest for production, where the answer is a real leader-elected
+# deployment. Saying so beats half-building it.
+#
+# With `failurePolicy: Fail`, restarting this Deployment stops
+# admissions cluster-wide for as long as it takes to come back. That is
+# the wall behaving as designed, and it belongs in your runbook.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lex-k8s
+  namespace: lex-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lex-k8s
+  template:
+    metadata:
+      labels:
+        app: lex-k8s
+    spec:
+      serviceAccountName: lex-k8s
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: wall
+          image: lex-k8s:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - serve
+            - --cert=/tls/tls.crt
+            - --key=/tls/tls.key
+            - --addr=0.0.0.0:8443
+            - --audit-dir=/audit
+          env:
+            - name: RUST_LOG
+              value: lex_k8s=info,kube=warn
+          ports:
+            - name: https
+              containerPort: 8443
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            - name: audit
+              mountPath: /audit
+          # `/readyz` is 503 until every cache has listed once, which
+          # keeps this pod out of the Service's endpoints until the wall
+          # can actually decide. An empty cache reads as "no
+          # NetworkPolicy selects this pod" — unrestricted egress — so a
+          # wall that served on a cold cache would admit what the
+          # cluster forbids.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+      volumes:
+        - name: tls
+          secret:
+            secretName: lex-k8s-tls
+        # An emptyDir, which is the honest shape of the gap: the chain
+        # is tamper-evident but locally persisted, so a compromised or
+        # simply restarted pod loses it. That is alpibrusl/lex-os#54,
+        # and it is fixed upstream — signed entries and off-box
+        # persistence — rather than papered over here. The head of every
+        # chain also goes to stdout, which is the part a log collector
+        # can keep today.
+        - name: audit
+          emptyDir: {}

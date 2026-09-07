@@ -55,3 +55,4 @@ webhooks:
         namespace: lex-system
         path: /narrow
         port: 443
+      # caBundle: <injected by cert-manager, or `kubectl` after you mint one>

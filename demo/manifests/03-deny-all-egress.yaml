@@ -1,0 +1,19 @@
+# The NetworkPolicy that makes the namespace's egress knowable.
+#
+# Without it, Kubernetes permits the pod to reach anything — which is
+# `network: Full`, above what the manifest grants. Applying it does not
+# change the pod; it changes what the cluster will let the pod do, and
+# the wall reads that on the next admission.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: payments-egress
+  namespace: payments
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: payments

@@ -27,3 +27,47 @@ serde_json = "1"
 sha2 = "0.11"
 hex = "0.4"
 thiserror = "2"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "fs"], optional = true }
+axum = { version = "0.8.9", optional = true }
+# `tls-rustls-no-provider`, not `tls-rustls`: the latter pins the
+# aws-lc-rs crypto provider, and kube brings rustls too. With two
+# providers compiled in, rustls has no default and every TLS handshake
+# fails at runtime with a message about a missing CryptoProvider — a
+# failure that only shows up in a cluster. One provider is chosen here
+# (ring: no cmake, no NASM, builds the same everywhere) and installed
+# explicitly at startup.
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "rustls-tls", "ring"], optional = true }
+# Pinned to an explicit API version rather than `latest`: `latest` floats
+# with the crate, so a routine `cargo update` would change the API surface
+# this wall compiles against without a line of this repo changing. Every
+# type read here — Pod, NetworkPolicy, Role, RoleBinding — has been `v1`
+# for years, so a 1.35 client reads a newer server's objects fine; the
+# demo cluster is 1.37.
+k8s-openapi = { version = "0.28.0", features = ["v1_35"], optional = true }
+tracing = { version = "0.1.44", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
+futures = { version = "0.3.34", optional = true }
+
+[features]
+# The wall's decision logic is a pure library and the CLI needs nothing
+# but serde. Serving it needs an HTTP stack, a TLS terminator and a
+# Kubernetes client — so that is a feature, off by default, and the
+# library half stays as cheap to depend on as it was.
+#
+# `lex-k8s serve` without it does not degrade into something weaker; it
+# says it was not built. Same rule as the rest of this repo: refuse,
+# don't downgrade.
+default = []
+serve = [
+    "dep:tokio",
+    "dep:futures",
+    "dep:axum",
+    "dep:axum-server",
+    "dep:rustls",
+    "dep:kube",
+    "dep:k8s-openapi",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]

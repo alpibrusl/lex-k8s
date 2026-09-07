@@ -126,23 +126,66 @@ That pod's *app* container is unremarkable. Reading only `containers[0]`
 
 ## Where this is
 
-**Milestones 1 and 2 of [#1](https://github.com/alpibrusl/lex-k8s/issues/1).**
+**Milestones 1–5 of [#1](https://github.com/alpibrusl/lex-k8s/issues/1).**
 A pure function from a `PodSpec` and a cluster snapshot to effect rows
 ([#2](https://github.com/alpibrusl/lex-k8s/issues/2)), the `LexManifest`
-CRD, the two admission walls, and the hash-chained audit
-([#3](https://github.com/alpibrusl/lex-k8s/issues/3)).
+CRD, the two admission walls and the hash-chained audit
+([#3](https://github.com/alpibrusl/lex-k8s/issues/3)), attestation
+([#4](https://github.com/alpibrusl/lex-k8s/issues/4)), the budget wall,
+and the serving webhook
+([#10](https://github.com/alpibrusl/lex-k8s/issues/10)).
 
-**There is no serving binary yet, and that is deliberate.** `lex-k8s
-admit` reads an `AdmissionReview` on stdin and writes the response on
-stdout — exactly what a webhook does between its TLS handshake and its
-HTTP reply. The deployment manifests are in [`deploy/`](deploy/). What
-is missing is the HTTP+TLS wrapper and a cluster to test it against;
-shipping an untested TLS server would be worse than shipping none, so
-the `kind` demo in #3 is still open and is the one part of this
-milestone nobody has run.
+**It runs in a cluster.** `./demo/kind.sh` goes from no cluster to a
+refused pod with the wall's own reason on the terminal, and CI runs it
+on every change — see [In a cluster](#in-a-cluster). Until milestone 5
+none of this had ever run inside one, and that sentence was the largest
+thing standing between the repo and a deployment.
 
-Not yet here: attestation
-([#4](https://github.com/alpibrusl/lex-k8s/issues/4)).
+## In a cluster
+
+```sh
+./demo/kind.sh          # create, deploy, and run all eight steps
+KEEP=1 ./demo/kind.sh   # ...and leave the cluster up
+```
+
+Eight steps, no mock. A real API server calls a real webhook over TLS,
+and every verdict comes from the same `admit()` / `narrow()` the CLI
+calls:
+
+1. cluster, image, CRD, RBAC, certificates, webhook — `failurePolicy: Fail`
+2. a pod that reaches past the grant is **refused**
+3. a NetworkPolicy lands, and **the same pod is admitted** — the spec did
+   not change, the cluster did, and the wall read it from a live watch
+4. a privileged pod with a hostPath mount and an ungranted secret is
+   **refused**
+5. a `LexManifest` that widens its parent is **refused by `/narrow`**
+6. the audit chains, one per pod admission
+7. the wall is scaled to zero and admissions **stop** — `failurePolicy:
+   Fail` doing its job, on a pod that was admitted a moment earlier
+8. what the restart cost the record — see caution 9
+
+### How it is wired
+
+`lex-k8s serve` is the CLI's `admit` and `narrow` behind TLS, and it
+decides nothing of its own. The two inputs the CLI takes as flags come
+from watch caches instead:
+
+| Flag, on the CLI | In the cluster | When it is missing |
+| --- | --- | --- |
+| `--manifest` | the one `LexManifest` in the pod's namespace | no manifest, no admission — and two is a refusal, not a coin toss |
+| `--snapshot` | NetworkPolicy + RBAC reflectors | no policy selects the pod ⇒ **unrestricted egress**, which is what Kubernetes does |
+
+Caches, not lookups, for the reason
+[`src/cluster.rs`](src/cluster.rs) already gives: the API server is
+calling *us*, inside its own request path, and calling back into it to
+decide is a deadlock waiting for a bad afternoon. `/readyz` stays 503
+until every cache has listed once, because a cold cache is
+indistinguishable from a cluster with no policies — and that reads as
+permission.
+
+Serving is behind the `serve` feature so the decision half stays cheap
+to depend on. A binary built without it says so rather than starting
+something weaker.
 
 ## The effect model
 
@@ -216,8 +259,12 @@ Three reasons, in order of how much they matter:
 3. The API server is calling *us*, inside its own request path. Calling
    back into it to decide is a deadlock waiting for a bad afternoon.
 
-The webhook builds the snapshot from informer caches before it decides.
-Staleness is handled there, and it is a separate problem from this one.
+The webhook builds the snapshot from watch caches before it decides
+([`src/serve/snapshot.rs`](src/serve/snapshot.rs)), and pins the
+`resourceVersion` of every object it read into the snapshot's
+`provenance` — which is hashed, so a verdict names the revision of the
+cluster it was made on. Staleness is handled there, and it is a
+separate problem from this one.
 
 ## Every container, not the first one
 
@@ -271,6 +318,16 @@ hands out authority they hold, never authority they do not.
 spec:
   parent: cluster/platform-default
 ```
+
+`cluster/<name>` resolves to `<name>` in the namespace the wall runs in
+(`lex-system`, or `--root-namespace`). The CRD is `scope: Namespaced`,
+so no genuinely cluster-scoped `LexManifest` can exist — left alone,
+every `parent: cluster/...` would be unresolvable in a real cluster,
+which this wall refuses, correctly and uselessly. Putting the ceiling in
+`lex-system` puts it where the authority to set it already lives, rather
+than inventing a second CRD scope with its own narrowing rule. **An
+unresolvable parent is a refusal**, not a pass: a child that could name
+a parent nobody can read would be granting itself whatever it liked.
 
 A constraint language can only enumerate what is forbidden. It has
 nowhere to put *"and this policy is itself bounded by that one"*. That
@@ -500,6 +557,29 @@ point of a typed record is that a reader does not have to regex prose.
    capability not on it still raises `exec`, to `sandboxed` rather than
    `full`. Getting the list wrong understates one pod; getting the
    default wrong would understate all of them.
+9. **The audit chain lives inside the thing it audits.** It is written
+   to the pod's own volume, unsigned — so a pod that restarts takes its
+   history with it, and a compromised one can rewrite it. Step 8 of the
+   demo shows exactly that happening rather than hiding it. The head of
+   every chain also goes to stdout, which is the part a log collector
+   keeps today. The fix is signed entries and storage the box cannot
+   reach: [alpibrusl/lex-os#54](https://github.com/alpibrusl/lex-os/issues/54),
+   upstream, where both gates get it at once.
+10. **`/narrow` decides without a chain of its own.** Manifest verdicts
+    reach the log but not the audit record — the chain's vocabulary is
+    pod-shaped. A manifest that widens its parent is the more
+    consequential of the two decisions, so this asymmetry is backwards
+    and is worth fixing.
+11. **One replica, and no leader election.** Each replica keeps its own
+    caches, and two caches can disagree for a moment after a
+    NetworkPolicy changes — so two replicas can give two verdicts for
+    one pod. One is honest for a demo and wrong for production.
+12. **Certificates are read from disk and never rotated.**
+    `deploy/bootstrap-certs.sh` mints a self-signed pair so the demo
+    needs nothing but `openssl`; a real deployment wants cert-manager.
+    A certificate the API server does not trust fails closed, which
+    with `failurePolicy: Fail` means every admission in the cluster
+    stops.
 
 ## Develop
 
@@ -507,6 +587,14 @@ point of a typed record is that a reader does not have to regex prose.
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
+
+# the server, which is behind a feature flag — CI runs both, because a
+# feature flag CI never turns on is code CI does not have
+cargo test --features serve
+cargo clippy --all-targets --features serve -- -D warnings
+
+# the wall in a real cluster (needs kind, kubectl, docker, openssl)
+./demo/kind.sh
 ```
 
 ## License

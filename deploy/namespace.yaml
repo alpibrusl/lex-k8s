@@ -1,0 +1,13 @@
+# The webhook's own namespace.
+#
+# `deploy/webhook.yaml` excludes it from the pod wall, along with
+# kube-system and kube-public. That is not a convenience: with
+# `failurePolicy: Fail`, a wall that gates the namespace its own pod
+# runs in cannot be restarted once it is down. A wall that can deadlock
+# its own cluster is one someone disables at 3am and never re-enables.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lex-system
+  labels:
+    kubernetes.io/metadata.name: lex-system

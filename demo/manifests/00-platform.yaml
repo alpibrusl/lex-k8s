@@ -1,0 +1,20 @@
+# The ceiling every namespace narrows from.
+#
+# It lives in `lex-system` — the namespace the wall runs in, and the one
+# only cluster admins can write to — and `parent: cluster/platform-default`
+# resolves here. See `Caches::manifest_by_reference`.
+apiVersion: lex.dev/v1alpha1
+kind: LexManifest
+metadata:
+  name: platform-default
+  namespace: lex-system
+spec:
+  goal: the ceiling every namespace narrows from
+  grant:
+    egress: ["postgres.payments.svc", "api.stripe.com:443", "metrics.internal:9090"]
+    secrets: ["payments-db", "observability-token"]
+    capabilities: ["NET_BIND_SERVICE"]
+    hostPath: false
+    privileged: false
+    hostNamespaces: false
+    imagePrefixes: ["registry.internal/"]
