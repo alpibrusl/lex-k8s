@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lex-k8s
+  namespace: lex-system
+spec:
+  selector:
+    app: lex-k8s
+  ports:
+    # 443 is what `webhook.yaml`'s clientConfig names; the container
+    # serves on 8443 so it needs no privileged port and can run as a
+    # non-root user.
+    - name: https
+      port: 443
+      targetPort: 8443

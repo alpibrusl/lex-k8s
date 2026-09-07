@@ -1,0 +1,28 @@
+# A pod that reaches past the grant, in three ways at once, so the
+# refusal has something to enumerate: a hostPath mount, a privileged
+# container, and a secret the manifest never named.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: debug
+  namespace: payments
+spec:
+  serviceAccountName: api
+  containers:
+    - name: debug
+      image: registry.internal/payments/debug@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      securityContext:
+        privileged: true
+      env:
+        - name: OBS
+          valueFrom:
+            secretKeyRef:
+              name: observability-token
+              key: token
+      volumeMounts:
+        - name: host
+          mountPath: /host
+  volumes:
+    - name: host
+      hostPath:
+        path: /

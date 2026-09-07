@@ -1,0 +1,23 @@
+# The manifest `/narrow` must refuse.
+#
+# It grants `hostPath: true` and an egress host its parent never named.
+# A team lead hands out authority they hold, never authority they do
+# not — and this is the wall a constraint language has nowhere to put:
+# Gatekeeper can enumerate what a pod may not do, but it has no place to
+# say "and this policy is itself bounded by that one".
+apiVersion: lex.dev/v1alpha1
+kind: LexManifest
+metadata:
+  name: payments-wider
+  namespace: payments
+spec:
+  goal: quietly grant itself more than the platform did
+  grant:
+    egress: ["postgres.payments.svc", "api.stripe.com:443", "exfil.example.com:443"]
+    secrets: ["payments-db"]
+    capabilities: ["SYS_ADMIN"]
+    hostPath: true
+    privileged: false
+    hostNamespaces: false
+    imagePrefixes: ["registry.internal/"]
+  parent: cluster/platform-default

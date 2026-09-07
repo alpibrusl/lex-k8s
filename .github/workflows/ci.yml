@@ -28,3 +28,33 @@ jobs:
         run: cargo fmt --check
       - name: Test
         run: cargo test
+
+      # The server is behind a feature flag, and a feature flag CI never
+      # turns on is code CI does not have. lex-os#54 makes exactly this
+      # complaint about the Firecracker perimeter: the default was
+      # flipped before its gate went green, so the path users get is the
+      # one nothing exercises. Not repeating it here.
+      - name: Build (serve)
+        run: cargo build --all-targets --features serve
+      - name: Clippy (serve; warnings are errors)
+        run: cargo clippy --all-targets --features serve -- -D warnings
+      - name: Test (serve)
+        run: cargo test --features serve
+
+  # The wall in a real cluster. Not a smoke test: it is the only place
+  # the TLS wrapper, the caBundle, the watch caches and `failurePolicy:
+  # Fail` are exercised at all, and every one of them is invisible to
+  # `cargo test` by construction.
+  kind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: lex-k8s-demo
+          # The demo creates its own cluster; this action is here for
+          # the `kind` binary and its cache.
+          install_only: true
+      - name: The kind demo
+        run: ./demo/kind.sh

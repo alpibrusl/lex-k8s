@@ -15,14 +15,15 @@
 //! refusal is a decision, not a malfunction, and a pipeline that
 //! conflates them will eventually read a broken wall as an admission.
 //!
-//! # There is no server here
+//! # The server is the same wall
 //!
 //! `admit` reads an `AdmissionReview` on stdin and writes the response
 //! on stdout, which is exactly what a webhook does between its TLS
-//! handshake and its HTTP reply. Wiring that up needs certificates, a
-//! `ValidatingWebhookConfiguration` and a cluster to test against; the
-//! deployment manifests are in `deploy/`, and the serving binary is
-//! deliberately not in this milestone rather than shipped untested.
+//! handshake and its HTTP reply. `lex-k8s serve` (feature `serve`) is
+//! that wrapper: it resolves the manifest and the cluster snapshot from
+//! watch caches instead of flags, and calls the same two functions.
+//! Nothing decides in the server, so the fixture corpus still tests the
+//! wall that actually runs.
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -39,6 +40,10 @@ usage:
                    [--spend <spend.json>] [--audit-out <log.json>] < review.json
   lex-k8s compile  --pod <pod.json> [--snapshot <cluster.json>]
   lex-k8s manifest narrow --parent <LexManifest.json> --child <LexManifest.json>
+  lex-k8s serve    --cert <tls.crt> --key <tls.key> [--addr 0.0.0.0:8443]
+                   [--trusted-keys <keyring.json>] [--prices <prices.json>]
+                   [--spend <spend.json>] [--audit-dir <dir>]
+                   [--trusted-image-prefix <prefix>]... [--root-namespace <ns>]
 
 `admit` reads an AdmissionReview on stdin and writes the response on stdout.
 --trusted-keys takes the `{\"trusted\":[...]}` keyring written by
@@ -60,6 +65,14 @@ this refuses new admissions only, and never evicts a running pod.
 Without --snapshot the cluster is read as having no NetworkPolicy, which in
 Kubernetes means unrestricted egress — not none.
 
+`serve` is the same wall behind TLS: POST /admit and POST /narrow, plus
+/healthz and /readyz. The manifest governing a namespace and the cluster
+snapshot come from watch caches rather than flags — the API server is
+calling us inside its own request path, and calling back into it to
+decide is a deadlock. /readyz stays 503 until every cache has listed
+once, because an empty cache reads as \"no NetworkPolicy\", which means
+unrestricted egress rather than none.
+
 exit: 0 admitted, 8 refused, 2 the wall could not run";
 
 fn main() -> ExitCode {
@@ -69,6 +82,7 @@ fn main() -> ExitCode {
         ["admit", rest @ ..] => cmd_admit(rest),
         ["compile", rest @ ..] => cmd_compile(rest),
         ["manifest", "narrow", rest @ ..] => cmd_narrow(rest),
+        ["serve", rest @ ..] => cmd_serve(rest),
         ["--help"] | ["-h"] | [] => {
             println!("{USAGE}");
             ExitCode::from(0)
@@ -80,11 +94,37 @@ fn main() -> ExitCode {
     }
 }
 
+/// Every value given for a flag, in order.
+///
+/// Both spellings: `--name value` and `--name=value`. The second is not
+/// a nicety — it is how flags are written in a Kubernetes `args:` list,
+/// where each element is one string, and a parser that only understood
+/// the first would leave a Deployment printing its usage on a crash
+/// loop with nothing to say why.
+fn flags<'a>(args: &[&'a str], name: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == name {
+            if let Some(v) = args.get(i + 1) {
+                out.push(*v);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix(name) {
+            if let Some(v) = rest.strip_prefix('=') {
+                out.push(v);
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 fn flag<'a>(args: &[&'a str], name: &str) -> Option<&'a str> {
-    args.iter()
-        .position(|a| *a == name)
-        .and_then(|i| args.get(i + 1))
-        .copied()
+    flags(args, name).into_iter().next()
 }
 
 fn read(path: &str) -> Result<String, ExitCode> {
@@ -432,5 +472,129 @@ fn cmd_narrow(args: &[&str]) -> ExitCode {
             );
             ExitCode::from(8)
         }
+    }
+}
+
+/// `serve`, when the feature is on.
+#[cfg(feature = "serve")]
+fn cmd_serve(args: &[&str]) -> ExitCode {
+    use std::path::PathBuf;
+
+    let (Some(cert), Some(key)) = (flag(args, "--cert"), flag(args, "--key")) else {
+        eprintln!("serve needs --cert and --key\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let addr = match flag(args, "--addr") {
+        None => None,
+        Some(a) => match a.parse() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("--addr {a} is not an address: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    // Repeatable, because a cluster can trust more than one registry
+    // and an operator should not have to encode a list into one flag.
+    let trusted_image_prefixes: Vec<String> = flags(args, "--trusted-image-prefix")
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    let opts = lex_k8s::serve::Options {
+        addr,
+        cert: PathBuf::from(cert),
+        key: PathBuf::from(key),
+        trusted_keys: flag(args, "--trusted-keys").map(PathBuf::from),
+        prices: flag(args, "--prices").map(PathBuf::from),
+        spend: flag(args, "--spend").map(PathBuf::from),
+        audit_dir: flag(args, "--audit-dir").map(PathBuf::from),
+        trusted_image_prefixes,
+        root_namespace: flag(args, "--root-namespace").map(str::to_string),
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "lex_k8s=info,kube=warn".into()),
+        )
+        .init();
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("could not start the runtime: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match runtime.block_on(lex_k8s::serve::run(opts)) {
+        Ok(()) => ExitCode::from(0),
+        Err(e) => {
+            eprintln!("serve: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// `serve`, when it was not built.
+///
+/// It says so rather than doing something weaker. A binary that
+/// silently lacked its server would be discovered by an operator whose
+/// admissions had stopped — which is the same "refuse, don't downgrade"
+/// rule the simulated perimeter follows in lex-os.
+#[cfg(not(feature = "serve"))]
+fn cmd_serve(_args: &[&str]) -> ExitCode {
+    eprintln!(
+        "this lex-k8s was built without the `serve` feature, so it has no server.\n\
+         Build it with `cargo build --release --features serve`, or use `admit` on \n\
+         stdin — the decision is identical either way."
+    );
+    ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flags;
+
+    /// Both spellings, and repeats of either. The `=` form is what a
+    /// Kubernetes `args:` list gives you, and the space form is what a
+    /// person types; a flag parser that took only one of them fails in
+    /// whichever context it was not tested in.
+    #[test]
+    fn flags_read_both_spellings() {
+        let args = [
+            "--cert=/tls/tls.crt",
+            "--key",
+            "/tls/tls.key",
+            "--trusted-image-prefix=registry.internal/",
+            "--trusted-image-prefix",
+            "ghcr.io/alpibrusl/",
+        ];
+        assert_eq!(flags(&args, "--cert"), vec!["/tls/tls.crt"]);
+        assert_eq!(flags(&args, "--key"), vec!["/tls/tls.key"]);
+        assert_eq!(
+            flags(&args, "--trusted-image-prefix"),
+            vec!["registry.internal/", "ghcr.io/alpibrusl/"]
+        );
+        assert!(flags(&args, "--audit-dir").is_empty());
+    }
+
+    /// A prefix is not a flag: `--audit` must not match `--audit-dir`,
+    /// or a typo silently configures something else.
+    #[test]
+    fn a_prefix_of_a_flag_is_not_that_flag() {
+        let args = ["--audit-dir=/audit"];
+        assert!(flags(&args, "--audit").is_empty());
+        assert_eq!(flags(&args, "--audit-dir"), vec!["/audit"]);
+    }
+
+    /// A flag with nothing after it yields nothing rather than
+    /// swallowing the next flag as its value.
+    #[test]
+    fn a_trailing_flag_has_no_value() {
+        assert!(flags(&["--cert"], "--cert").is_empty());
     }
 }

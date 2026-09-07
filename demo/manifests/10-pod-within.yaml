@@ -1,0 +1,23 @@
+# A pod inside the grant: a signed image from the trusted registry, one
+# named secret, no capabilities, read-only root.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: api
+  namespace: payments
+spec:
+  serviceAccountName: api
+  containers:
+    - name: api
+      image: registry.internal/payments/api@sha256:3f7a1b2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: payments-db
+              key: password

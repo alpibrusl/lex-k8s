@@ -1,0 +1,47 @@
+# What the wall may read, and nothing else.
+#
+# Six kinds, all `get/list/watch`. The wall makes no writes at all: it
+# decides and it records, and the record goes to its own volume and to
+# stdout. A validating webhook that could write to the cluster would be
+# a strictly larger blast radius than the thing it is protecting
+# against.
+#
+# The `lexmanifests` entry is the interesting one. The wall reads the
+# grants; it cannot create or amend them. Whoever may write a
+# `LexManifest` decides what a namespace is allowed — that authority
+# lives in the cluster's own RBAC, which is where it belongs, and
+# `/narrow` is what stops a writer from handing out more than they
+# hold.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lex-k8s
+  namespace: lex-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lex-k8s
+rules:
+  - apiGroups: ["lex.dev"]
+    resources: ["lexmanifests"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "clusterroles", "rolebindings", "clusterrolebindings"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lex-k8s
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lex-k8s
+subjects:
+  - kind: ServiceAccount
+    name: lex-k8s
+    namespace: lex-system
