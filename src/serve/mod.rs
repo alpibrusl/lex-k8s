@@ -29,6 +29,7 @@
 
 pub mod cache;
 pub mod handlers;
+pub mod ledger;
 pub mod snapshot;
 
 use std::net::SocketAddr;
@@ -187,6 +188,26 @@ pub async fn run(opts: Options) -> Result<(), ServeError> {
     let client = kube::Client::try_default().await?;
     let caches = cache::start(client);
 
+    // One ledger for the life of the process (alpibrusl/lex-k8s#13).
+    // It lives beside the decision chains, which means it dies with the
+    // same pod — worth having anyway, because the signed checkpoint it
+    // prints on every append goes to stdout, and that is the one place
+    // a collector keeps something this pod does not own.
+    let ledger = match &opts.audit_dir {
+        None => None,
+        Some(dir) => {
+            let l = ledger::Ledger::start(
+                Some(dir.join("ledger.json")),
+                audit_key.as_deref().cloned(),
+                Some(dir.display().to_string()),
+            )
+            .map_err(|e| ServeError::Input(e.to_string()))?;
+            let (len, head) = l.state().map_err(|e| ServeError::Input(e.to_string()))?;
+            tracing::info!(len, %head, "ledger started");
+            Some(Arc::new(l))
+        }
+    };
+
     let wall = handlers::Wall {
         caches: caches.clone(),
         keyring,
@@ -194,6 +215,7 @@ pub async fn run(opts: Options) -> Result<(), ServeError> {
         trusted_image_prefixes: opts.trusted_image_prefixes.clone(),
         audit_dir: opts.audit_dir.clone(),
         audit_key,
+        ledger,
         root_namespace: opts
             .root_namespace
             .clone()

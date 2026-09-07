@@ -164,7 +164,8 @@ calls:
    Fail` doing its job, on a pod that was admitted a moment earlier
 8. a refusal is rewritten into an admission and the chain rebuilt — the
    chain accepts it, **the seal refuses it**
-9. what the restart cost the record — see caution 9
+9. a decision file is deleted — **the ledger names the gap**
+10. what the restart cost the record — see caution 9
 
 ### How it is wired
 
@@ -215,11 +216,46 @@ unsealed log is reported as unsealed rather than as passing: the wall
 warns loudly at startup if it is writing one, and `audit verify` says
 `NOT CHECKED` rather than `OK` when you give it no key.
 
-**What sealing does not close here.** Each admission gets its own chain,
-so there is no tail to truncate — and equally, **deleting a whole
-decision file leaves no gap to notice**. A checkpoint cannot help:
-you cannot commit to the length of a set of files nobody is counting.
-That needs one running ledger of decision heads, and it is not built.
+### The ledger: a deleted decision is not a silent one
+
+Sealing proves nobody *rewrote* a decision. It cannot prove a decision
+that happened still exists — a seal covers what a record says, never
+whether the record is still there. Each admission gets its own chain, so
+`rm` on one file used to leave nothing to notice.
+
+The wall keeps a **ledger**: one long-lived sealed chain it appends to
+after every decision, carrying the subject, the verdict and the head of
+that decision's own chain. A deleted file is then a head the ledger
+names with nothing behind it.
+
+```sh
+lex-k8s audit reconcile --ledger /audit/ledger.json --decisions /audit                         --trusted-key <public-hex>
+```
+
+```
+REFUSED — the ledger and the decisions disagree.
+  DELETED?    witnessed head 95898f2e… has no file behind it
+```
+
+It checks **both** directions: a file the ledger never witnessed is a
+planted decision, or a ledger that lost its tail, and either way the two
+records disagree. `/narrow` is witnessed here too — before the ledger it
+wrote no record at all, and a manifest that widens its parent is the
+more consequential of the two decisions this wall makes.
+
+On every append the wall prints a **signed checkpoint** to stdout —
+`(domain, len, head)` over the ledger. That is the artifact that
+outlives the pod, because a log collector already keeps stdout and the
+pod does not own it. `audit reconcile --checkpoint` holds a ledger to
+one, which catches the attack one level up: truncating the ledger's tail
+to drop the entries witnessing the decisions you also deleted.
+
+**What none of it survives.** The ledger lives on the same volume as the
+decisions, so the disk going away takes both. Sealing stops a rewrite,
+the ledger names a deletion, a checkpoint catches a truncation — and a
+collector holding one checkpoint is what makes the last of those work.
+Durable storage is a deployment decision this repo does not make for
+you.
 
 ## The effect model
 
@@ -591,16 +627,16 @@ point of a typed record is that a reader does not have to regex prose.
    capability not on it still raises `exec`, to `sandboxed` rather than
    `full`. Getting the list wrong understates one pod; getting the
    default wrong would understate all of them.
-9. **The audit chain lives inside the thing it audits, and only half of
-   that is fixed.** Entries are now sealed, so a decision cannot be
-   *rewritten* by whoever holds the volume — step 8 of the demo proves
-   it. Nothing stops one being *deleted*: each admission gets its own
-   chain, so a missing file leaves no gap, and a checkpoint cannot
-   commit to the length of a set of files nobody counts. Step 9 shows a
-   restart taking the record with it. Closing that needs a running
-   ledger of decision heads written somewhere the pod does not own. The
-   head of every chain also goes to stdout, which is what a log
-   collector keeps today.
+9. **The audit record lives inside the thing it audits.** Three layers
+   now stand on it — entries are sealed (a decision cannot be
+   *rewritten*), a ledger witnesses every decision (a deletion is
+   *named*), and a signed checkpoint goes to stdout on every append (a
+   ledger truncated to hide both is *contradicted*). Steps 8 and 9 of
+   the demo run the first two attacks for real. What none of them
+   survives is the volume itself going away, which step 10 shows: the
+   ledger sits beside the decisions. Only the checkpoints leave the pod,
+   and only if something is collecting stdout. A durable volume or a
+   collector is a deployment decision this repo does not make for you.
 10. **`/narrow` decides without a chain of its own.** Manifest verdicts
     reach the log but not the audit record — the chain's vocabulary is
     pod-shaped. A manifest that widens its parent is the more

@@ -26,6 +26,7 @@ use axum::Json;
 use crate::admission::Spend;
 use crate::review::cannot_run;
 use crate::serve::cache::{contents, Caches, ManifestLookup};
+use crate::serve::ledger::Ledger;
 use crate::serve::snapshot::{self, PodSubject};
 use crate::{admit, admit_sealed, narrow, respond, AdmissionReview, Keyring, LexManifest, Verdict};
 
@@ -50,6 +51,15 @@ pub struct Wall {
     pub audit_dir: Option<std::path::PathBuf>,
     /// Seals every decision's chain, when the operator mounted a key.
     pub audit_key: Option<Arc<crate::SigningKey>>,
+    /// The running witness (alpibrusl/lex-k8s#13).
+    ///
+    /// One chain for the life of the process, appended to after every
+    /// decision, so a deleted decision file leaves a gap somebody can
+    /// see. A `Mutex` because decisions are concurrent and a chain is
+    /// a sequence: two appends racing would be two entries claiming the
+    /// same `seq`, which is the one thing `Chain::verify` is entitled
+    /// to assume never happens.
+    pub ledger: Option<Arc<Ledger>>,
     /// Where `parent: cluster/<name>` looks. See
     /// [`Caches::manifest_by_reference`].
     pub root_namespace: String,
@@ -223,11 +233,33 @@ pub async fn admit_pod(State(wall): State<Wall>, body: String) -> Response {
         Verdict::Admit => "admitted",
         Verdict::Deny { .. } => "refused",
     };
+
+    // Witnessed after the decision is on disk, never before: a ledger
+    // entry for a decision whose file was never written would report a
+    // gap that is the wall's own fault, and send an auditor looking for
+    // a deletion that did not happen.
+    if let Some(ledger) = &wall.ledger {
+        if let Err(e) = ledger.witness(crate::LedgerEvent::PodDecided {
+            uid: uid.clone(),
+            namespace: request.namespace.clone(),
+            name: meta.name.clone(),
+            verdict: verdict.to_string(),
+            decision_head: decision.audit.head(),
+            decision_entries: decision.audit.len() as u64,
+            snapshot_sha256: snap.content_id(),
+            signer: meta.signer.clone(),
+        }) {
+            // A witness nobody can keep is not a witness. Refusing here
+            // is the same rule as refusing when the decision chain
+            // cannot be written.
+            return failed(&uid, &format!("could not witness the decision: {e}"));
+        }
+    }
     tracing::info!(
         verdict,
         namespace = %request.namespace,
-        name = %request.meta().name,
-        submitter = %request.meta().signer.unwrap_or_else(|| "unauthenticated".into()),
+        name = %meta.name,
+        submitter = %meta.signer.clone().unwrap_or_else(|| "unauthenticated".into()),
         snapshot = %snap.content_id(),
         audit_head = %decision.audit.head(),
         entries = decision.audit.len(),
@@ -301,7 +333,23 @@ pub async fn narrow_manifest(State(wall): State<Wall>, body: String) -> Response
         Err(e) => return refuse(&uid, &format!("parent `{reference}` cannot be read: {e}")),
     };
 
-    match narrow(&parent, &child) {
+    let outcome = narrow(&parent, &child);
+    // `/narrow` wrote no record at all before #13 — its verdicts reached
+    // the log and nothing else, and a manifest that widens its parent is
+    // the more consequential of the two decisions this wall makes.
+    if let Some(ledger) = &wall.ledger {
+        if let Err(e) = ledger.witness(crate::LedgerEvent::ManifestDecided {
+            uid: uid.clone(),
+            child: child_crd.reference(),
+            parent: Some(reference.clone()),
+            verdict: if outcome.is_ok() { "narrows" } else { "widens" }.to_string(),
+            reason: outcome.as_ref().err().map(|e| e.to_string()),
+            signer: request.meta().signer.clone(),
+        }) {
+            return failed(&uid, &format!("could not witness the decision: {e}"));
+        }
+    }
+    match outcome {
         Ok(()) => {
             tracing::info!(
                 verdict = "narrows",
