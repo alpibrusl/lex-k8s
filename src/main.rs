@@ -29,9 +29,9 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use lex_k8s::{
-    admission::Spend, admit, narrow, respond, review::cannot_run, AdmissionEvent, AdmissionReview,
-    Chain, ClusterSnapshot, Keyring, LexManifest, PriceList, Reversibility, SigningKey,
-    SpendReport, Standing, Verdict, VerifyingKey,
+    admission::Spend, admit, narrow, reconcile, respond, review::cannot_run, AdmissionEvent,
+    AdmissionReview, Chain, Checkpoint, ClusterSnapshot, Keyring, Ledger, LedgerEvent, LexManifest,
+    PriceList, Reversibility, SigningKey, SpendReport, Standing, Verdict, VerifyingKey,
 };
 
 const USAGE: &str = "\
@@ -43,6 +43,8 @@ usage:
   lex-k8s compile  --pod <pod.json> [--snapshot <cluster.json>]
   lex-k8s manifest narrow --parent <LexManifest.json> --child <LexManifest.json>
   lex-k8s audit verify --log <audit.json> [--trusted-key <hex>]...
+  lex-k8s audit reconcile --ledger <ledger.json> --decisions <dir>
+                   [--trusted-key <hex>]... [--checkpoint <cp.json>]
   lex-k8s audit pubkey [--key <hex> | --key-file <path>]
   lex-k8s serve    --cert <tls.crt> --key <tls.key> [--addr 0.0.0.0:8443]
                    [--trusted-keys <keyring.json>] [--prices <prices.json>]
@@ -76,6 +78,14 @@ is what checks it. Prefer the file: a secret in argv is a secret in `ps`.
 Without --snapshot the cluster is read as having no NetworkPolicy, which in
 Kubernetes means unrestricted egress — not none.
 
+`audit reconcile` holds a ledger and a directory of decision chains to
+each other, in both directions. A head the ledger witnesses with no file
+behind it is a DELETED decision — which sealing cannot catch, because a
+seal proves what a record says and not that the record still exists. A
+file the ledger never witnessed is a planted one, or a ledger that lost
+its tail. With --checkpoint it also catches a ledger truncated from the
+end, which is the same attack one level up.
+
 `serve` is the same wall behind TLS: POST /admit and POST /narrow, plus
 /healthz and /readyz. The manifest governing a namespace and the cluster
 snapshot come from watch caches rather than flags — the API server is
@@ -94,6 +104,7 @@ fn main() -> ExitCode {
         ["compile", rest @ ..] => cmd_compile(rest),
         ["manifest", "narrow", rest @ ..] => cmd_narrow(rest),
         ["audit", "verify", rest @ ..] => cmd_audit_verify(rest),
+        ["audit", "reconcile", rest @ ..] => cmd_audit_reconcile(rest),
         ["audit", "pubkey", rest @ ..] => cmd_audit_pubkey(rest),
         ["serve", rest @ ..] => cmd_serve(rest),
         ["--help"] | ["-h"] | [] => {
@@ -592,6 +603,169 @@ fn cmd_serve(_args: &[&str]) -> ExitCode {
          stdin — the decision is identical either way."
     );
     ExitCode::from(2)
+}
+
+/// `audit reconcile` — the ledger and the decisions, held to each other.
+///
+/// Sealing (#12) proves nobody rewrote a decision. It cannot prove a
+/// decision that happened still exists: a seal covers what a record
+/// says, not whether the record is still there. Only a second record
+/// that counted them can do that.
+fn cmd_audit_reconcile(args: &[&str]) -> ExitCode {
+    let (Some(ledger_path), Some(dir)) = (flag(args, "--ledger"), flag(args, "--decisions")) else {
+        eprintln!("audit reconcile needs --ledger and --decisions\n\n{USAGE}");
+        return ExitCode::from(2);
+    };
+    let src = match read(ledger_path) {
+        Ok(s) => s,
+        Err(c) => return c,
+    };
+    let ledger: Ledger = match Chain::from_json(&src) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("could not read the ledger {ledger_path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = ledger.verify() {
+        println!("REFUSED — the ledger's own chain is broken.");
+        println!("  {e}");
+        return ExitCode::from(8);
+    }
+
+    // A ledger that does not begin at `wall_started` was truncated from
+    // the front, and the chain cannot see that: a suffix re-chained
+    // from GENESIS is well-formed. The first entry is the one position
+    // the hash chain structurally cannot defend.
+    match ledger.entries().first().map(|e| &e.event) {
+        Some(LedgerEvent::WallStarted { .. }) => {}
+        Some(other) => {
+            println!("REFUSED — the ledger does not begin where a ledger begins.");
+            println!(
+                "  first entry is `{}`, not `wall_started`.",
+                other.subject()
+            );
+            println!("  A chain re-based from its second entry verifies perfectly; this is");
+            println!("  the one position the hashes cannot defend, so it is checked by name.");
+            return ExitCode::from(8);
+        }
+        None => {
+            println!("REFUSED — the ledger is empty, which no running wall ever writes.");
+            return ExitCode::from(8);
+        }
+    }
+
+    let trusted_hex = flags(args, "--trusted-key");
+    let mut trusted = Vec::new();
+    for h in &trusted_hex {
+        match decode_key32(h).and_then(|b| {
+            VerifyingKey::from_bytes(&b).map_err(|_| format!("`{h}` is not an Ed25519 public key"))
+        }) {
+            Ok(k) => trusted.push(k),
+            Err(e) => {
+                eprintln!("--trusted-key {e}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if !trusted.is_empty() {
+        if let Err(e) = ledger.verify_seals(&trusted) {
+            println!("REFUSED — the ledger's seals do not hold.");
+            println!("  {e}");
+            return ExitCode::from(8);
+        }
+    }
+
+    // The truncation wall, one level up: a checkpoint the wall printed
+    // to stdout, kept by a collector the pod does not own.
+    if let Some(cp_path) = flag(args, "--checkpoint") {
+        if trusted.is_empty() {
+            eprintln!(
+                "--checkpoint needs --trusted-key: a checkpoint nobody vouched for is one \
+                 the ledger's own holder could have written"
+            );
+            return ExitCode::from(2);
+        }
+        let cp_src = match read(cp_path) {
+            Ok(s) => s,
+            Err(c) => return c,
+        };
+        let cp: Checkpoint = match serde_json::from_str(&cp_src) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("could not read the checkpoint {cp_path}: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let Some(verified) = trusted.iter().find_map(|k| cp.verify(k).ok()) else {
+            println!("REFUSED — the checkpoint is not signed by any trusted key.");
+            return ExitCode::from(8);
+        };
+        if let Err(e) = ledger.verify_against(&verified) {
+            println!("REFUSED — the ledger contradicts a checkpoint.");
+            println!("  {e}");
+            return ExitCode::from(8);
+        }
+        println!(
+            "checkpoint: OK — the ledger is at least the {} entries committed to.",
+            verified.as_checkpoint().len
+        );
+    }
+
+    // Every decision chain the directory actually holds.
+    let mut found: Vec<String> = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("could not read the decisions directory {dir}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // The ledger lives in the same directory and is not a decision.
+        if path.file_name().and_then(|n| n.to_str()) == Some("ledger.json") {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        match Chain::<AdmissionEvent>::from_json(&text) {
+            Ok(c) => found.push(c.head()),
+            Err(e) => {
+                println!("REFUSED — {} is not a decision chain: {e}", path.display());
+                return ExitCode::from(8);
+            }
+        }
+    }
+
+    let r = reconcile(&ledger, &found);
+    println!(
+        "ledger: {} entries, head sha256:{}",
+        ledger.len(),
+        ledger.head()
+    );
+    println!("matched: {} decision(s) witnessed and present", r.matched);
+    if r.is_clean() {
+        println!("\nACCEPTED — every witnessed decision is present, and every present");
+        println!("decision was witnessed.");
+        return ExitCode::from(0);
+    }
+    println!("\nREFUSED — the ledger and the decisions disagree.");
+    for h in &r.missing {
+        println!("  DELETED?    witnessed head {h} has no file behind it");
+    }
+    for h in &r.unwitnessed {
+        println!("  UNWITNESSED file with head {h} that the ledger never recorded");
+    }
+    println!(
+        "\nA missing file is the attack sealing cannot catch: a seal proves what a\n\
+         record says, never that the record is still there."
+    );
+    ExitCode::from(8)
 }
 
 /// `audit pubkey` — the public half of an audit signing key.

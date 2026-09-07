@@ -145,7 +145,7 @@ echo "$out" | grep -qi "widens" || fail "the refusal did not say the child widen
 bold "6. the audit chain, before anything restarts"
 POD=$(kubectl -n lex-system get pod -l app=lex-k8s -o jsonpath='{.items[0].metadata.name}')
 kubectl -n lex-system logs "$POD" | grep -E "decided|manifest (admitted|refused)" | sed 's/^/  | /'
-CHAINS=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls /audit | wc -l' | tr -d ' \r')
+CHAINS=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls /audit | grep -v ledger.json | wc -l' | tr -d ' \r')
 note "$CHAINS decision chains on the pod's volume, one per pod admission"
 # Three pod admissions so far: refused (step 2), admitted (step 3),
 # refused (step 4). `/narrow`'s two decisions are in the log but not on
@@ -202,7 +202,7 @@ POD=$(kubectl -n lex-system get pod -l app=lex-k8s -o jsonpath='{.items[0].metad
 # worth demonstrating. Nobody rewrites a log to make themselves look
 # worse.
 kubectl apply -f "$ROOT/demo/manifests/11-pod-beyond.yaml" >/dev/null 2>&1 || true
-CHAIN=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls -t /audit | head -1' | tr -d '\r')
+CHAIN=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls -t /audit | grep -v ledger.json | head -1' | tr -d '\r')
 kubectl -n lex-system exec "$POD" -- cat "/audit/$CHAIN" > "$WORKDIR/decision.json"
 "$LEXK8S" audit verify --log "$WORKDIR/decision.json" --trusted-key "$AUDIT_PK" | sed 's/^/  | /'
 
@@ -220,8 +220,30 @@ if "$LEXK8S" audit verify --log "$WORKDIR/forged.json" --trusted-key "$AUDIT_PK"
 fi
 note "sealed: a rewritten verdict passes the chain and fails the seal."
 
-bold "9. what the restart cost the record"
-AFTER=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls /audit | wc -l' | tr -d ' \r')
+bold "9. a DELETED decision is named"
+# Sealing proved nobody can rewrite a decision. It cannot prove one that
+# happened still exists — a seal covers what a record says, never
+# whether the record is still there. The ledger is the second record
+# that counts them (alpibrusl/lex-k8s#13).
+rm -rf "$WORKDIR/decisions"; mkdir -p "$WORKDIR/decisions"
+for f in $(kubectl -n lex-system exec "$POD" -- sh -c 'ls /audit' | tr -d '\r'); do
+  kubectl -n lex-system exec "$POD" -- cat "/audit/$f" > "$WORKDIR/decisions/$f"
+done
+"$LEXK8S" audit reconcile --ledger "$WORKDIR/decisions/ledger.json" \
+  --decisions "$WORKDIR/decisions" --trusted-key "$AUDIT_PK" | sed 's/^/  | /'
+
+# Now delete the refusal, the way anyone with the volume would.
+VICTIM=$(ls -t "$WORKDIR/decisions" | grep -v ledger.json | head -1)
+rm "$WORKDIR/decisions/$VICTIM"
+note "deleted $VICTIM from the decision set"
+if "$LEXK8S" audit reconcile --ledger "$WORKDIR/decisions/ledger.json" \
+     --decisions "$WORKDIR/decisions" --trusted-key "$AUDIT_PK" 2>&1 | sed 's/^/  | /'; then
+  fail "a deleted decision must be refused"
+fi
+note "the ledger names the gap. A seal could not have."
+
+bold "10. what the restart cost the record"
+AFTER=$(kubectl -n lex-system exec "$POD" -- sh -c 'ls /audit | grep -v ledger.json | wc -l' | tr -d ' \r')
 note "before the restart: $CHAINS chains. After it: $AFTER."
 [ "${AFTER:-0}" -lt "${CHAINS:-0}" ] \
   || fail "expected the restart to lose the local chains; this step is the honest one"
@@ -231,11 +253,12 @@ note "before the restart: $CHAINS chains. After it: $AFTER."
 # gets its own chain, so a deleted file leaves no gap to notice, and a
 # checkpoint cannot help — you cannot commit to the length of a set of
 # files nobody is counting.
-note "the earlier chains went with the pod. Sealing stops a decision being"
-note "rewritten; it does not stop one being deleted, because there is no"
-note "running ledger to show a gap. That needs one chain across decisions."
-note "The heads printed on stdout above are what a collector keeps today."
+note "the earlier chains went with the pod — the ledger included, because it"
+note "lives on the same volume. Sealing stops a rewrite and the ledger names a"
+note "deletion, but neither survives the disk going away. What does survive is"
+note "the signed checkpoint the wall prints on every append: a collector holds"
+note "those, and a truncated ledger contradicts any one of them."
 
 bold "the wall ran in a cluster."
-note "Nine steps, no mock: a real API server called a real webhook over TLS,"
+note "Ten steps, no mock: a real API server called a real webhook over TLS,"
 note "and every verdict came from the same admit()/narrow() the CLI calls."

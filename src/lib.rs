@@ -27,6 +27,7 @@ pub mod cluster;
 pub mod cost;
 pub mod effect;
 pub mod facet;
+pub mod ledger;
 pub mod manifest;
 pub mod review;
 /// The webhook. Feature-gated: see `src/serve/mod.rs` for why.
@@ -49,6 +50,7 @@ pub use cluster::{ClusterSnapshot, EgressPolicy, RbacRule};
 pub use cost::{CostError, PodReservation, PriceList, Reservation, SpendReport, Undeclared};
 pub use effect::{Effect, ImageDoubt, Reach, SecretVia, Source};
 pub use facet::{Denial, PodFacet};
+pub use ledger::{reconcile, Ledger, LedgerEvent, Reconciliation};
 pub use lex_os_audit::{Chain, Checkpoint, SigningKey, VerifyingKey};
 pub use lex_os_manifest::{Grant, Level, Reversibility};
 pub use manifest::{narrow, pod_facet, LexManifest, ManifestReadError};
