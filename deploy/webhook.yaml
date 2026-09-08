@@ -18,14 +18,27 @@ webhooks:
     sideEffects: None
     failurePolicy: Fail
     timeoutSeconds: 5
-    # Never gate the namespaces that would have to be running for the
-    # webhook itself to come back. A wall that can deadlock its own
-    # cluster is one someone will disable at 3am and never re-enable.
+    # Opt IN, by label, rather than gating everything except a
+    # hand-maintained exclusion list.
+    #
+    # The exclusion form is the obvious one and it is how you wedge a
+    # cluster you actually use. `failurePolicy: Fail` means a wall that
+    # is down stops *all* scheduling, so "gate everything except the
+    # three namespaces I thought of" is a bet that the list is complete —
+    # and on a real cluster it never is. A CNI, a CSI driver,
+    # cert-manager, the monitoring stack: each is a namespace that must
+    # keep scheduling for the cluster to recover, and each one you forget
+    # is discovered during an outage.
+    #
+    # Labelling a namespace in is reversible under pressure. Labelling
+    # one out, while nothing schedules and the webhook that would let you
+    # fix it cannot start, is not.
+    #
+    #   kubectl label ns payments lex.dev/gated=true      # gate it
+    #   kubectl label ns payments lex.dev/gated-          # stop
     namespaceSelector:
-      matchExpressions:
-        - key: kubernetes.io/metadata.name
-          operator: NotIn
-          values: [kube-system, kube-public, lex-system]
+      matchLabels:
+        lex.dev/gated: "true"
     rules:
       - apiGroups: [""]
         apiVersions: ["v1"]
