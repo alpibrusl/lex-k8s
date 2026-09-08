@@ -192,7 +192,16 @@ pub fn respond(uid: &str, decision: &Decision) -> AdmissionReview {
             // Reported on the way *in*, while there is still someone
             // reading. A dimension nobody declared a policy for is not
             // the same as one that passed.
-            warnings: decision.unchecked.clone(),
+            // Both go to `kubectl apply`'s own output. A grant the
+            // cluster cannot enforce is exactly the kind of thing the
+            // person deploying should be told at the moment they deploy,
+            // rather than discovering in a README (#17).
+            warnings: decision
+                .unchecked
+                .iter()
+                .cloned()
+                .chain(decision.unenforceable.iter().cloned())
+                .collect(),
         },
         Verdict::Deny { first, all } => AdmissionResponse {
             uid: uid.to_string(),
