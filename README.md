@@ -360,6 +360,7 @@ Neither alone is enough, and the gap is not theoretical:
 | reaches `exfil.example.com` under an allowlist policy | passes | **refuses** |
 | sets `hostNetwork: true` | **refuses** | passes any host list |
 | mounts a Secret the manifest never named | passes | **refuses** |
+| runs an image outside the manifest's `imagePrefixes` | passes | **refuses** |
 
 The facet lives on the same `lex_os_manifest::Manifest`, in the slot
 [lex-os#71](https://github.com/alpibrusl/lex-os/issues/71) opened —
@@ -378,6 +379,18 @@ refusing every pod. An empty list means provenance is not checked *by
 the manifest*, and an admitted pod says so in its `warnings` rather than
 passing silently. "We did not look" and "we looked and it was fine" are
 different facts.
+
+A **non-empty** list is enforced: every container image in the pod —
+init, sidecar and ephemeral alike — must carry one of those prefixes,
+or the pod is refused by name. That is worth stating because it was
+untrue until [#19](https://github.com/alpibrusl/lex-k8s/issues/19). The
+field parsed, narrowed correctly against a parent, and gated nothing;
+only the cluster snapshot's `trusted_image_prefixes` decided, so
+tightening the mandate left an untrusted image admitted. It was the one
+axis where "one manifest, two enforcement points" visibly did not hold.
+Both now apply, and a pod must satisfy each: the cluster says which
+registries exist, the manifest says which of them *this* workload may
+draw from.
 
 ## `parent` is the wall Gatekeeper structurally lacks
 
@@ -584,69 +597,85 @@ point of a typed record is that a reader does not have to regex prose.
 1. **A webhook is only a wall if it cannot be bypassed.** The shipped
    `ValidatingWebhookConfiguration` uses `failurePolicy: Fail`, which is
    not a tuning knob: under `Ignore`, a webhook outage means every pod is
-   admitted unchecked. The consequence belongs in your runbook — if this
-   webhook is down, admissions stop. And anyone with cluster-admin can
-   delete the object; the audit chain records that they did, it does not
-   stop them. The comparison to Gatekeeper is winnable on narrowing, not
-   on tamper-resistance.
+   admitted unchecked. The consequence belongs in your runbook, and it is
+   narrower than it sounds: because the `namespaceSelector` is opt-in, a
+   wall that is down stops pod creation **in gated namespaces only**.
+   Measured with the deployment scaled to zero — a pod in a gated
+   namespace is refused, one in an ungated namespace is admitted. The
+   blast radius is the namespaces you opted in, not the cluster; an
+   exclusion-list design answers differently and worse. And anyone with
+   cluster-admin can delete the object; the audit chain records that
+   they did, it does not stop them. The comparison to Gatekeeper is
+   winnable on narrowing, not on tamper-resistance.
 2. **`isolationFloor` is declared and not enforced here.** The
    RuntimeClass that would back it is deliberately in another repo, so a
    manifest asking for `microvm` is refused rather than accepted
    silently — an operator must not come away believing a boundary exists
    that does not. Spell it `unenforced-microvm` to say yes on purpose.
-3. **The effect row is lossy, and that is structural.** Sidecars, CSI
+3. **An egress grant naming an external host is checked, not enforced.**
+   `NetworkPolicy` matches CIDRs and selectors and has no hostname, so
+   `postgres.payments.svc` maps onto a namespaceSelector and the cluster
+   really does stop the rest — while `api.stripe.com:443` maps onto
+   nothing narrower than "anywhere, on 443". The wall still refuses a pod
+   demanding more than the grant; what the *cluster* cannot do is hold an
+   admitted pod to that host afterwards. Those entries are disclosed on
+   every decision and surfaced as `kubectl apply` warnings, where the
+   person deploying will read them. Deliberately not a refusal: no
+   manifest a team could write would clear it, so refusing them for it
+   would be punishing a submitter for the substrate (#17).
+4. **The effect row is lossy, and that is structural.** Sidecars, CSI
    drivers and operators act on the pod's behalf; the row captures what
    the spec *declares*, not what the node does. Bounding the rest needs
    the RuntimeClass, which is not in this repo and by design never will
    be.
-4. **Signing is asserted, not verified.** This crate has no keys, no
+5. **Signing is asserted, not verified.** This crate has no keys, no
    registry access, and no business doing crypto in an admission path.
    It records what the snapshot claims. What milestone 3 adds is a
    record of *decisions*, earned per submitter — not verification of
    the images themselves, which still rests on the snapshot's word.
-5. **A keyring cannot tell "never scored" from "scored badly".** Both
+6. **A keyring cannot tell "never scored" from "scored badly".** Both
    read as absent, and this wall deliberately does not guess between
    them — `lex producer-trust recompute --tool <id>` is where an
    operator finds out which. The threshold also lives with whoever
    exported the keyring, not in the manifest, so two namespaces can
    disagree about what 700 means.
-6. **The budget bounds committed reservation, not the invoice.**
+7. **The budget bounds committed reservation, not the invoice.**
    `requests × list rate` ignores utilisation, spot pricing,
    reservations and every negotiated discount. A reader who treats it
    as a meter will size the ceiling wrong. It is also per-namespace and
    monthly, and it trusts the spend report it is handed: a stale report
    understates what is committed, always in the direction that admits
    the pod.
-7. **The waiver is the only thing standing decides, and there is one of
+8. **The waiver is the only thing standing decides, and there is one of
    them.** `imagePrefixes` is currently the sole dimension a manifest
    can leave undeclared, so today the trust wall has exactly one lever.
    That is honest rather than elegant: more levers should arrive as
    more dimensions become waivable, not by inventing authority for a
    score to hand out.
-8. **The dangerous-capability list is a list, and lists are wrong.** A
+9. **The dangerous-capability list is a list, and lists are wrong.** A
    capability not on it still raises `exec`, to `sandboxed` rather than
    `full`. Getting the list wrong understates one pod; getting the
    default wrong would understate all of them.
-9. **The audit record lives inside the thing it audits.** Three layers
-   now stand on it — entries are sealed (a decision cannot be
-   *rewritten*), a ledger witnesses every decision (a deletion is
-   *named*), and a signed checkpoint goes to stdout on every append (a
-   ledger truncated to hide both is *contradicted*). Steps 8 and 9 of
-   the demo run the first two attacks for real. What none of them
-   survives is the volume itself going away, which step 10 shows: the
-   ledger sits beside the decisions. Only the checkpoints leave the pod,
-   and only if something is collecting stdout. A durable volume or a
-   collector is a deployment decision this repo does not make for you.
-10. **`/narrow` decides without a chain of its own.** Manifest verdicts
+10. **The audit record lives inside the thing it audits.** Three layers
+    now stand on it — entries are sealed (a decision cannot be
+    *rewritten*), a ledger witnesses every decision (a deletion is
+    *named*), and a signed checkpoint goes to stdout on every append (a
+    ledger truncated to hide both is *contradicted*). Steps 8 and 9 of
+    the demo run the first two attacks for real. What none of them
+    survives is the volume itself going away, which step 10 shows: the
+    ledger sits beside the decisions. Only the checkpoints leave the pod,
+    and only if something is collecting stdout. A durable volume or a
+    collector is a deployment decision this repo does not make for you.
+11. **`/narrow` decides without a chain of its own.** Manifest verdicts
     reach the log but not the audit record — the chain's vocabulary is
     pod-shaped. A manifest that widens its parent is the more
     consequential of the two decisions, so this asymmetry is backwards
     and is worth fixing.
-11. **One replica, and no leader election.** Each replica keeps its own
+12. **One replica, and no leader election.** Each replica keeps its own
     caches, and two caches can disagree for a moment after a
     NetworkPolicy changes — so two replicas can give two verdicts for
     one pod. One is honest for a demo and wrong for production.
-12. **Certificates are read from disk and never rotated.**
+13. **Certificates are read from disk and never rotated.**
     `deploy/bootstrap-certs.sh` mints a self-signed pair so the demo
     needs nothing but `openssl`; a real deployment wants cert-manager.
     A certificate the API server does not trust fails closed, which
