@@ -95,6 +95,9 @@ done
 note "the API server can reach the wall over TLS"
 
 kubectl create namespace payments >/dev/null
+# Opt in. The wall gates only namespaces carrying this label, so the demo
+# has to ask for it — which is the point: nothing is gated by surprise.
+kubectl label namespace payments lex.dev/gated=true >/dev/null
 kubectl -n payments create serviceaccount api >/dev/null
 
 bold "1. the grants"
