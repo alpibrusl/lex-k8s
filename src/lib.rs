@@ -86,6 +86,16 @@ pub struct PodEffects {
     /// same as an effect row; what it *costs* needs a price list, which
     /// is the wall's business rather than the compiler's.
     pub reservation: PodReservation,
+    /// Every image the pod names, in spec order.
+    ///
+    /// A fact about the spec, like `reservation`, and recorded for the
+    /// same reason: the wall needs it and the compiler is where it is
+    /// known. Until #19 the only images reaching a decision were the
+    /// ones the *snapshot* already doubted, so a manifest naming a
+    /// narrower `imagePrefixes` than the cluster's trust list had no
+    /// effect at all — the row that would have carried the check was
+    /// never emitted.
+    pub images: Vec<String>,
 }
 
 impl PodEffects {
@@ -337,6 +347,12 @@ pub fn compile(
         rows,
         demands,
         reservation: cost::effective_requests(&spec.all_containers())?,
+        images: spec
+            .all_containers()
+            .iter()
+            .map(|(_, c)| c.image.clone())
+            .filter(|i| !i.is_empty())
+            .collect(),
     })
 }
 

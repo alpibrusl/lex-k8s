@@ -201,6 +201,13 @@ pub struct Decision {
     /// For an unscored submitter each of these is also a refusal — see
     /// [`Wall::Trust`].
     pub unchecked: Vec<String>,
+    /// Grants this cluster can check but cannot enforce (#17).
+    ///
+    /// Disclosed on every decision, admitted or refused, because the
+    /// alternative is a grant that reads as enforcement and is not.
+    /// Distinct from `unchecked`: nothing the submitter does can clear
+    /// this, so it never turns on their standing.
+    pub unenforceable: Vec<String>,
     /// Who asked, as the API server authenticated them.
     pub signer: Option<String>,
     /// What the keyring said about them.
@@ -399,6 +406,40 @@ fn admit_inner(
         }
     }
 
+    // Wall 2b — image provenance, from the *manifest*.
+    //
+    // The rows above can only refuse an image the cluster snapshot
+    // already doubted, because a trusted image emits no row to refuse
+    // (#19). That left `spec.grant.imagePrefixes` as decoration: a team
+    // handed a mandate and told to narrow it — "from now on, only images
+    // under your own path" — changed nothing, and nothing said so.
+    //
+    // So every image is held to the manifest as well. The two lists
+    // intersect rather than override: the cluster says which registries
+    // it will accept at all, the manifest says which of those this
+    // workload may use, and a manifest can only narrow. An empty list
+    // still means "the manifest names no policy" and is reported as an
+    // unchecked dimension below, not read as "nothing is allowed".
+    if !facet.image_prefixes.is_empty() {
+        for image in &pod.images {
+            if !facet
+                .image_prefixes
+                .iter()
+                .any(|p| !p.is_empty() && image.starts_with(p.as_str()))
+            {
+                refusals.push(Refusal {
+                    wall: Wall::Narrowing,
+                    effect: format!("image:{image}"),
+                    source: "spec.containers[].image".into(),
+                    reason: format!(
+                        "`{image}` is outside the `imagePrefixes` this manifest grants"
+                    ),
+                    grant_allows: facet.image_prefixes.clone(),
+                });
+            }
+        }
+    }
+
     // Wall 3 — standing. Not a new authority: every dimension named
     // here is one the *manifest* declared no policy for, so admitting
     // under it is a waiver the manifest granted. A submitter with a
@@ -408,6 +449,8 @@ fn admit_inner(
     // through. It cannot admit anything they refused, which is the
     // property that keeps the manifest the ceiling.
     let unchecked = unchecked_dimensions(&facet, &pod);
+    let unenforceable = unenforceable_egress(&facet);
+
     if standing.needs_the_verb_named() {
         for dimension in &unchecked {
             refusals.push(Refusal {
@@ -547,6 +590,7 @@ fn admit_inner(
     Ok(Decision {
         verdict,
         unchecked,
+        unenforceable,
         pod,
         audit,
         signer: request.signer.clone(),
@@ -608,9 +652,64 @@ fn granted_for(facet: &PodFacet, effect: &Effect) -> Vec<String> {
     }
 }
 
+/// Can a Kubernetes `NetworkPolicy` hold a pod to this egress entry?
+///
+/// Only if it names something in the cluster. `NetworkPolicy` matches
+/// CIDRs and selectors; it has no hostname, and there is no plan for
+/// one. `postgres.payments.svc` maps onto a namespaceSelector and the
+/// cluster really does stop the rest. `api.stripe.com:443` maps onto
+/// nothing narrower than "anywhere, on 443" (#17).
+///
+/// Conservative on purpose: anything this cannot recognise as
+/// in-cluster is treated as external, because the failure of guessing
+/// wrong in that direction is a warning nobody needed, and in the other
+/// direction it is a grant that claims enforcement it does not have.
+fn is_in_cluster(host: &str) -> bool {
+    let name = host.split(':').next().unwrap_or(host).trim_end_matches('.');
+    if name.is_empty() {
+        return false;
+    }
+    // A bare service name, or one of Kubernetes' own suffixes.
+    !name.contains('.')
+        || name.ends_with(".svc")
+        || name.ends_with(".svc.cluster.local")
+        || name.ends_with(".cluster.local")
+}
+
+/// Grants this cluster can check but cannot hold a pod to (#17).
+///
+/// Kept apart from [`unchecked_dimensions`] deliberately, and the
+/// distinction is the whole point. An unchecked dimension is a *waiver
+/// the manifest granted*: the author could have declared the policy and
+/// chose not to, so making it turn on the submitter's standing is fair.
+/// This is not that. No manifest can make `NetworkPolicy` understand a
+/// hostname, so a team that declared everything correctly and simply
+/// needs Stripe can do nothing to clear it. Refusing them for it would
+/// punish a submitter for a limit of the substrate.
+///
+/// So it is disclosed on every decision and refuses nobody by default.
+/// A deployment that would rather fail closed can say so
+/// (`--refuse-unenforceable-egress`), which is the shape
+/// `isolationFloor` already uses: this repo refuses what it cannot back,
+/// once the operator has said that is what they want.
+fn unenforceable_egress(facet: &PodFacet) -> Vec<String> {
+    facet
+        .egress
+        .iter()
+        .filter(|h| !is_in_cluster(h))
+        .map(|h| {
+            format!(
+                "`{h}` is outside the cluster: NetworkPolicy has no hostname, so this pod \
+                 can be held to a port but not to that host"
+            )
+        })
+        .collect()
+}
+
 /// Dimensions the manifest declared no policy for.
 fn unchecked_dimensions(facet: &PodFacet, pod: &PodEffects) -> Vec<String> {
     let mut out = Vec::new();
+
     if facet.image_prefixes.is_empty()
         && pod
             .rows
@@ -757,6 +856,223 @@ mod tests {
             tc.source
         );
         assert!(tc.grant_allows.iter().any(|g| g.contains("network")));
+    }
+
+    // ── Egress the cluster cannot enforce (#17) ───────────────────
+
+    #[test]
+    fn in_cluster_names_are_enforceable() {
+        for h in [
+            "postgres",
+            "postgres.payments.svc",
+            "postgres.payments.svc.cluster.local",
+            "postgres.payments.svc:5432",
+        ] {
+            assert!(is_in_cluster(h), "{h} maps onto a selector");
+        }
+    }
+
+    #[test]
+    fn external_hosts_are_not() {
+        for h in [
+            "api.stripe.com:443",
+            "github.com",
+            "1.2.3.4",
+            "example.co.uk",
+        ] {
+            assert!(!is_in_cluster(h), "{h} has no NetworkPolicy expression");
+        }
+    }
+
+    /// The disclosure, and the reason it is not a refusal: a grant
+    /// naming an external host is still a perfectly good grant. The
+    /// pod is admitted and the operator is told what the cluster can
+    /// and cannot hold it to.
+    #[test]
+    fn an_external_grant_is_disclosed_but_admitted() {
+        let spec = r#"{"containers":[{"name":"api",
+            "image":"registry.internal/payments/api@sha256:aa"}]}"#;
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None, None).unwrap();
+        assert!(d.verdict.allowed(), "{:?}", d.verdict);
+        assert!(
+            d.unenforceable.iter().any(|u| u.contains("api.stripe.com")),
+            "{:?}",
+            d.unenforceable
+        );
+    }
+
+    /// And it must not become the submitter's problem. `unchecked`
+    /// drives the standing wall, so putting this there would refuse an
+    /// unscored submitter for a limit of Kubernetes that no manifest
+    /// they could write would clear.
+    #[test]
+    fn it_is_not_a_waiver_the_submitter_could_have_avoided() {
+        let spec = r#"{"containers":[{"name":"api",
+            "image":"registry.internal/payments/api@sha256:aa"}]}"#;
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None, None).unwrap();
+        assert!(
+            !d.unchecked.iter().any(|u| u.contains("stripe")),
+            "an unenforceable grant is not an undeclared one: {:?}",
+            d.unchecked
+        );
+    }
+
+    /// A manifest that only names in-cluster destinations promises
+    /// nothing the cluster cannot deliver.
+    #[test]
+    fn an_in_cluster_only_grant_discloses_nothing() {
+        let m = LexManifest::read(
+            r#"{
+              "metadata": { "name": "payments", "namespace": "payments" },
+              "spec": {
+                "goal": "serve the payments API",
+                "grant": { "egress": ["postgres.payments.svc"], "secrets": [],
+                           "capabilities": [] }
+              }
+            }"#,
+        )
+        .unwrap()
+        .1;
+        let spec = r#"{"containers":[{"name":"api",
+            "image":"registry.internal/payments/api@sha256:aa"}]}"#;
+        let d = admit(spec, &m, &snapshot(), &meta(), None, None).unwrap();
+        assert!(d.unenforceable.is_empty(), "{:?}", d.unenforceable);
+    }
+
+    // ── Image provenance from the manifest (#19) ──────────────────
+    //
+    // The cluster snapshot says which registries it will accept at all.
+    // The manifest says which of those *this workload* may use. Until
+    // #19 only the first was consulted, because an image the snapshot
+    // trusted emitted no row for the second to refuse — so narrowing
+    // `imagePrefixes` changed nothing and nothing said so.
+
+    /// The manifest narrows inside what the cluster already trusts.
+    fn narrowed_to_payments() -> Manifest {
+        LexManifest::read(
+            r#"{
+              "metadata": { "name": "payments", "namespace": "payments" },
+              "spec": {
+                "goal": "serve the payments API",
+                "grant": {
+                  "egress": ["postgres.payments.svc"],
+                  "secrets": [],
+                  "capabilities": [],
+                  "imagePrefixes": ["registry.internal/payments/"]
+                }
+              }
+            }"#,
+        )
+        .unwrap()
+        .1
+    }
+
+    #[test]
+    fn an_image_outside_the_manifests_prefixes_is_refused() {
+        // The cluster trusts all of `registry.internal/`, so the snapshot
+        // has no objection. The manifest is the only thing that can
+        // refuse this, which is the whole point of the field.
+        let spec = r#"{"containers":[{"name":"api",
+            "image":"registry.internal/shared/base@sha256:aa"}]}"#;
+        let d = admit(
+            spec,
+            &narrowed_to_payments(),
+            &snapshot(),
+            &meta(),
+            None,
+            None,
+        )
+        .unwrap();
+        let Verdict::Deny { all, .. } = &d.verdict else {
+            panic!("a manifest that names imagePrefixes must hold images to them");
+        };
+        let r = all
+            .iter()
+            .find(|r| r.effect.starts_with("image:"))
+            .expect("the refusal names the image");
+        assert!(r.reason.contains("imagePrefixes"), "{}", r.reason);
+        assert!(
+            r.grant_allows
+                .iter()
+                .any(|g| g == "registry.internal/payments/"),
+            "the operator is told what is allowed: {:?}",
+            r.grant_allows
+        );
+    }
+
+    #[test]
+    fn an_image_inside_the_manifests_prefixes_is_admitted() {
+        let spec = r#"{"containers":[{"name":"api",
+            "image":"registry.internal/payments/api@sha256:aa"}]}"#;
+        let d = admit(
+            spec,
+            &narrowed_to_payments(),
+            &snapshot(),
+            &meta(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(d.verdict.allowed(), "{:?}", d.verdict);
+    }
+
+    /// Init containers run first and with the same reach; an image
+    /// policy that only reads `containers[]` is not an image policy.
+    #[test]
+    fn an_init_containers_image_is_held_to_the_same_prefixes() {
+        let spec = r#"{"containers":[{"name":"api",
+            "image":"registry.internal/payments/api@sha256:aa"}],
+            "initContainers":[{"name":"tuner","image":"registry.internal/ops@sha256:bb"}]}"#;
+        let d = admit(
+            spec,
+            &narrowed_to_payments(),
+            &snapshot(),
+            &meta(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!d.verdict.allowed(), "an init container is a container");
+    }
+
+    /// An empty list is "no policy declared", not "nothing permitted".
+    /// Reading it as the latter would refuse every pod under a manifest
+    /// that simply never mentioned images, and the waiver it actually
+    /// implies is already reported as an unchecked dimension.
+    #[test]
+    fn a_manifest_naming_no_prefixes_does_not_refuse_on_images() {
+        let spec = r#"{"containers":[{"name":"api",
+            "image":"registry.internal/payments/api@sha256:aa"}]}"#;
+        let d = admit(spec, &manifest(), &snapshot(), &meta(), None, None).unwrap();
+        let refused_on_image = match &d.verdict {
+            Verdict::Deny { all, .. } => all.iter().any(|r| r.effect.starts_with("image:")),
+            _ => false,
+        };
+        assert!(!refused_on_image, "{:?}", d.verdict);
+    }
+
+    /// The manifest may only narrow. A prefix the cluster does not trust
+    /// is not made trustworthy by a manifest naming it.
+    #[test]
+    fn a_manifest_cannot_widen_past_what_the_cluster_trusts() {
+        let m = LexManifest::read(
+            r#"{
+              "metadata": { "name": "payments", "namespace": "payments" },
+              "spec": {
+                "goal": "serve the payments API",
+                "grant": { "egress": [], "secrets": [], "capabilities": [],
+                           "imagePrefixes": ["docker.io/"] }
+              }
+            }"#,
+        )
+        .unwrap()
+        .1;
+        let spec = r#"{"containers":[{"name":"api","image":"docker.io/library/nginx@sha256:aa"}]}"#;
+        let d = admit(spec, &m, &snapshot(), &meta(), None, None).unwrap();
+        assert!(
+            !d.verdict.allowed(),
+            "the cluster trusts only registry.internal/; a manifest cannot grant past it"
+        );
     }
 
     /// The privileged init container from milestone 1: reading only
