@@ -47,6 +47,17 @@ spec:
             # the hashes are derived. The seal is the part they cannot
             # forge (lex-os#54). Without this flag the wall still runs
             # and says loudly that the log is unsealed.
+            # NOTE: this reads the `lex-k8s-audit-key` Secret, which the
+            # manifests in this directory do NOT create. Applying deploy/
+            # without it leaves the pod in ContainerCreating indefinitely
+            # -- kubelet retries the mount and nothing surfaces the cause
+            # unless you `describe pod`. Create it first:
+            #
+            #   kubectl -n lex-system create secret generic lex-k8s-audit-key \
+            #     --from-literal=audit.key="$(openssl rand -hex 32)"
+            #
+            # Keep the key. Verifying a sealed log needs the public half,
+            # which `lex-k8s audit pubkey --key <hex>` derives.
             - --audit-key-file=/audit-key/audit.key
           env:
             - name: RUST_LOG
