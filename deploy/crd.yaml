@@ -62,10 +62,10 @@ spec:
                 budget:
                   type: object
                   properties:
-                    wallClockSecs: { type: integer }
-                    maxCommands: { type: integer }
-                    maxMoneyCents: { type: integer }
-                    maxApiCalls: { type: integer }
+                    wall_clock_secs: { type: integer }
+                    max_commands: { type: integer }
+                    max_money_cents: { type: integer }
+                    max_api_calls: { type: integer }
                 isolationFloor:
                   type: string
                   description: >-
