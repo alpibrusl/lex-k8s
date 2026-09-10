@@ -44,7 +44,7 @@ use crate::facet::PodFacet;
 
 /// The custom resource, as it appears on the API server.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LexManifest {
     #[serde(default)]
     pub api_version: String,
@@ -64,7 +64,14 @@ pub struct Metadata {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// `deny_unknown_fields` because a field this reader does not recognise
+/// was being ignored in silence, and silence is the wrong answer twice
+/// over here. `isolation_floor` instead of `isolationFloor` parsed
+/// happily and left the floor unset; the API server's own pruning does
+/// the same to anything the CRD does not declare, so a mis-spelled
+/// declaration could vanish at both layers and the manifest still be
+/// admitted. Same reasoning as alpibrusl/lex-os#101.
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Spec {
     #[serde(default)]
     pub goal: String,

@@ -76,3 +76,7 @@ serve = [
     "dep:tracing",
     "dep:tracing-subscriber",
 ]
+
+[dev-dependencies]
+# Test-only: the CRD/reader drift check reads deploy/crd.yaml.
+serde_yaml = "0.9"
